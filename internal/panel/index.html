@@ -160,7 +160,7 @@ button.primary:hover:not(:disabled) { filter: brightness(1.08); }
 button.ghost { background: transparent; }
 button.danger { color: var(--bad); }
 button.danger:hover:not(:disabled) { border-color: var(--bad); }
-button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
+button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; white-space: nowrap; }
 button.icon { padding: 7px 9px; }
 input, select {
   font: inherit; color: var(--ink); background: var(--surface-2);
@@ -174,6 +174,9 @@ label.fld { display: block; margin-bottom: 14px; }
 label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
 label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
 .inline { display: flex; align-items: center; gap: 9px; }
+/* 内联按钮（如「显示」）不能被 flex 压缩到换行：中文两字会被拆成竖排 */
+.inline > input { flex: 1 1 auto; min-width: 0; }
+.inline > button { flex: 0 0 auto; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
 .stats {
@@ -292,6 +295,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
 .switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
 .switch .lb { font-size: 13.5px; }
+/* 请求地址栏：等宽字体便于核对端口，长地址允许换行不撑破布局 */
+.ep-grid { display: flex; flex-direction: column; gap: 7px; }
+.ep-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border: 1px solid var(--line-soft); border-radius: 8px;
+  background: var(--surface-2, rgba(127,127,127,.04));
+}
+.ep-lb { flex: 0 0 96px; font-size: 12.5px; color: var(--ink-3); }
+.ep-val {
+  flex: 1 1 auto; min-width: 0; font-size: 12.5px;
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  color: var(--ink, inherit); background: none; padding: 0;
+  word-break: break-all; user-select: text;
+}
+/* 空值（如局域网未开放）时不显示破折号占位，改为弱化的说明文字 */
+.ep-val.empty { font-family: inherit; color: var(--ink-3); }
+.ep-row > .xs { flex: 0 0 auto; }
+.ep-note { margin-top: 8px; }
 .savebar {
   display: flex; align-items: center; gap: 12px; padding: 13px 17px;
   border-top: 1px solid var(--line-soft); background: var(--surface-2);
@@ -649,14 +670,43 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
           <div class="pad">
             <div class="grid2">
-              <label class="fld"><span class="lb">监听地址</span>
+              <label class="fld"><span class="lb" id="lbListen">监听地址</span>
                 <input name="listen" placeholder=":7863">
-                <span class="hint">改动需重启进程</span></label>
+                <span class="hint" id="hintListen">改动需重启进程</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
                 <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
-                <span class="hint">立即生效（含面板自身）</span></label>
+                <span class="hint">立即生效（含面板自身）</span>
+                <div class="inline" id="rerollWrap" hidden style="margin-top:7px">
+                  <button type="button" class="xs ghost" id="btnRerollKey">重新生成密钥</button>
+                  <span class="hint" id="rerollHint"></span>
+                </div></label>
             </div>
+            <div class="hr"></div>
+            <!-- 请求地址：直接可复制，省得用户去翻日志找端口 -->
+            <div class="ep-grid">
+              <div class="ep-row">
+                <span class="ep-lb">本机请求地址</span>
+                <code class="ep-val" id="epLocal">—</code>
+                <button type="button" class="xs" data-ep="epLocal">复制</button>
+              </div>
+              <div class="ep-row">
+                <span class="ep-lb">API Base URL</span>
+                <code class="ep-val" id="epApi">—</code>
+                <button type="button" class="xs" data-ep="epApi">复制</button>
+              </div>
+              <div class="ep-row">
+                <span class="ep-lb">局域网请求地址</span>
+                <code class="ep-val" id="epLan">—</code>
+                <button type="button" class="xs" data-ep="epLan">复制</button>
+              </div>
+            </div>
+            <div class="hint ep-note" id="epNote"></div>
+            <div class="hint" id="epListen" hidden></div>
+            <!-- 局域网开关：默认关闭。桌面版默认只绑 127.0.0.1，不暴露给局域网。 -->
+            <div class="switch" id="lanSwitchWrap" hidden><span class="lb">允许局域网访问</span>
+              <input type="checkbox" name="desktop_allow_lan" id="cfgAllowLAN"></div>
+            <div class="hint" id="lanHint" hidden>打开后其它设备可用「局域网请求地址」连接。保存会重启内核，局域网内可访问你的账号池，请确认密钥不是留空。</div>
           </div>
         </div>
 
@@ -921,7 +971,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" style="width:420px">
     <header>
       <h3>需要访问密钥</h3>
-      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
+      <div class="hint">该网关已启用 api_key 鉴权。密钥在配置文件 config.json 里；遗忘时可在配置页重新生成。</div>
     </header>
     <div class="body">
       <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password">

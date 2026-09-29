@@ -1,0 +1,21 @@
+# 构建产物（桌面版 exe 不进版本库，由 scripts/build.go 生成）
+wb2api-desktop
+wb2api-desktop.exe
+wb2api-desktop-debug.exe
+*.exe
+
+# 安装包输出目录（*.exe 已覆盖，这里显式声明意图）
+dist/*.exe
+
+# 本地数据（若有人把数据目录指向仓库内）
+auths/
+data/
+config.json
+desktop.json
+
+# 图标设计中间产物
+assets/_check*.png
+
+# Windows 资源（由 assets/tray.ico + git tag 自动生成，见 scripts/build.go）
+# 不入库：二进制文件，且换图标/改版本后必须重新生成，入库容易出现「改了 ico 忘了改 syso」
+wb2api-desktop.syso

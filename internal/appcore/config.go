@@ -1,5 +1,5 @@
 // config.go 加载 JSON 配置 + 环境变量覆盖。
-package main
+package appcore
 
 import (
 	"crypto/rand"
@@ -19,8 +19,21 @@ import (
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	AuthDir   string `json:"auth_dir"`   // ./auths（桌面模式：数据目录下的 auths）
+	StateFile string `json:"state_file"` // ./data/state.json（桌面模式：数据目录下的 data/state.json）
+
+	// Desktop 桌面应用模式：路径相对数据目录解析为绝对路径，见 config_desktop.go。
+	// 缺省 false = 服务端部署语义（相对 CWD），老配置与 Docker 部署零影响。
+	Desktop bool `json:"desktop"`
+	// DesktopDataDir 桌面模式数据目录覆盖；空 = 平台默认（Windows:
+	// %APPDATA%\WorkBuddy2API，可用 WB2A_DATA_DIR 覆盖）。
+	DesktopDataDir string `json:"desktop_data_dir"`
+	// DesktopAllowLAN 允许局域网访问：桌面版默认只绑 127.0.0.1（不暴露给局域网），
+	// 打开后绑 0.0.0.0，局域网内其它设备才能连。改动需重启内核。
+	//
+	// 用 AllowLAN 而不用绑地址字符串表达意图：用户想表达的是「让局域网能连」，
+	// 不是「绑哪个字面地址」；把 0.0.0.0 暴露成配置项只会让人填错。
+	DesktopAllowLAN bool `json:"desktop_allow_lan"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -226,6 +239,8 @@ func Default() *Config {
 // Load 从文件读，再用 WB2A_* env 覆盖。
 func Load(path string) (*Config, error) {
 	c := Default()
+	// explicitPaths 记录配置里是否显式写了 auth_dir/state_file（见下方 desktop 分支）。
+	explicitPaths := false
 	if path != "" {
 		// 目录检查：Docker bind mount 在宿主机文件缺失时会静默创建同名目录，
 		// 直接 ReadFile 会报 "Incorrect function" 之类晦涩错误，这里给出可操作提示。
@@ -238,11 +253,20 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
+		// 是否「派生」按原始 JSON 里这两个键**在不在**判定，而不是按反序列化结果——
+		// ParseConfigInto 先套用了 Default()，从结果里分不出「用户显式写的」与「缺省值」。
+		explicitPaths = jsonHasKey(raw, "auth_dir") || jsonHasKey(raw, "state_file")
 		if _, err := ParseConfigInto(raw, c); err != nil {
 			return nil, err
 		}
 	}
 	applyEnv(c)
+	// 桌面模式：把 auth_dir/state_file 解析为数据目录下的绝对路径（见 config_desktop.go）。
+	if path != "" && c.Desktop {
+		if _, err := applyDesktopLayout(c, explicitPaths); err != nil {
+			return nil, err
+		}
+	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
@@ -266,16 +290,27 @@ func ParseConfig(raw []byte) (*Config, error) {
 	return ParseConfigInto(raw, Default())
 }
 
+// NewAPIKey 生成一个随机 API 密钥（18 字节 crypto/rand → base64url → "sk-" 前缀）。
+//
+// 抽成独立函数是为了让「重置密钥」与首启生成走同一条路径：两处各写一份生成逻辑，
+// 迟早会在长度、前缀或熵源上漂移。
+func NewAPIKey() (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("gen api_key: %w", err)
+	}
+	return "sk-" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
 // 值取自 Default()（含超时/熔断/签到排程等推荐值），api_key 用 crypto/rand 随机生成：
 // 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
 // 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
 func WriteDefault(path string) (string, error) {
-	raw := make([]byte, 18)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("gen api_key: %w", err)
+	key, err := NewAPIKey()
+	if err != nil {
+		return "", err
 	}
-	key := "sk-" + base64.RawURLEncoding.EncodeToString(raw)
 	c := Default()
 	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
@@ -370,6 +405,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
+	}
+	if v := os.Getenv("WB2A_DESKTOP_DATA_DIR"); v != "" {
+		c.DesktopDataDir = v
 	}
 }
 

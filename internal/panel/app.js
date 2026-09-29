@@ -409,7 +409,7 @@ $('btnLogPin').onclick = () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
-  listen: ['listen'], api_key: ['api_key'],
+  listen: ['listen'], api_key: ['api_key'], desktop_allow_lan: ['desktop_allow_lan'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
@@ -449,17 +449,104 @@ async function loadConfig() {
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
       else if (Array.isArray(v)) el.value = v.join(', ');
+      else if (name === 'listen') el.value = displayPort(v); // 桌面模式下只显示端口号
       else el.value = v == null ? '' : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
+    loadEndpoints();
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
+
+/* 请求地址栏：数据来自后端实际监听信息（不是配置值，桌面版端口可能已回退）。
+   局域网那一行做三态显示，避免给出一个连不通的地址。 */
+async function loadEndpoints() {
+  let d;
+  try { d = await api('endpoints'); } catch (e) { return; }
+  const set = (id, v, emptyText) => {
+    const el = $(id);
+    const s = v || '';
+    el.textContent = s || (emptyText || '—');
+    el.dataset.copy = s;                       // 空值不给复制内容
+    el.classList.toggle('empty', !s);
+  };
+  set('epLocal', d.localhost);
+  set('epApi', d.api_base);
+  set('epLan', d.lan_available ? (d.lan_addr || d.lan_ip || '') : '',
+      d.desktop ? '未开放' : '由 listen 决定');
+
+  // 局域网开关只在桌面宿主下显示（服务端部署由 listen 自己决定绑定范围）。
+  const isDesktop = !!d.desktop;
+  $('lanSwitchWrap').hidden = !isDesktop;
+  $('lanHint').hidden = !isDesktop;
+  if (isDesktop) $('cfgAllowLAN').checked = !!d.lan_enabled;
+
+  const note = $('epNote');
+  note.textContent = d.lan_note || '';
+  note.hidden = !d.lan_note;
+
+  // 「监听地址」在桌面模式下改成「监听端口」。
+  //
+  // 桌面版**不用**这个字段的 host 部分：实际绑回环还是全网卡由「允许局域网访问」决定。
+  // 保留 ":7863" 这种写法会让人以为填什么都行、甚至以为填了就开放给网段了——
+  // 填了不生效，比不显示更糟。所以桌面模式下改标签为「监听端口」并只显示端口号，
+  // 让 UI 与实际语义一致。服务端部署仍按原样显示完整地址（那里 listen 就是真的绑定值）。
+  const cfg = cfgLoaded || {};
+  const desktop = !!cfg.desktop;
+  setLabel('lbListen', desktop ? '监听端口' : '监听地址');
+  setLabel('hintListen', desktop ? '仅端口号；实际绑定范围由下方「允许局域网访问」决定' : '改动需重启进程');
+  // 「重新生成密钥」只在桌面版提供：服务端部署的密钥由部署方掌握，界面一键换掉
+  // 可能把其他人锁在门外。桌面版是单用户场景，用户自己就是管理员。
+  const rw = $('rerollWrap');
+  if (rw) rw.hidden = !desktop;
+  const listenEl = $('cfgForm').elements['listen'];
+  if (listenEl) listenEl.placeholder = desktop ? '7863' : ':7863';
+
+  // 实际生效的监听地址：桌面版把它当"首选端口"，端口可能回退；绑回环还是全网卡
+  // 由开关决定。不显示出来用户会以为配置没生效。
+  const el = $('epListen');
+  el.textContent = d.listen ? '实际生效：' + d.listen : '';
+  el.hidden = !d.listen;
+}
+
+/* 复制按钮：按钮上的 data-ep 指向要复制的元素 id。 */
+document.querySelectorAll('[data-ep]').forEach(btn => {
+  btn.onclick = async () => {
+    const v = ($(btn.dataset.ep).dataset.copy || '').trim();
+    if (!v) { toast('还没有可复制的地址', 'err'); return; }
+    try { await navigator.clipboard.writeText(v); toast('已复制：' + v, 'ok'); }
+    catch (e) {
+      // 部分 WebView / 非安全上下文禁用剪贴板 API，退回选中文本让用户手动复制。
+      const r = document.createRange(); r.selectNodeContents($(btn.dataset.ep));
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+      toast('已选中，请按 Ctrl+C 复制', 'ok');
+    }
+  };
+});
+/* 桌面模式下「监听端口」字段只收端口号，这里把配置里的完整地址归一成端口，
+   避免用户看到 ":7863" 这种需要猜语义的写法。 */
+function listenPort(v) {
+  const s = (v == null ? '' : String(v)).trim();
+  if (!s) return '';
+  const m = s.match(/(\d+)\s*$/);   // ":7863" / "0.0.0.0:7863" / "7863" 都取尾部数字
+  return m ? m[1] : s;
+}
+function displayPort(v) {
+  return (cfgLoaded && cfgLoaded.desktop) ? listenPort(v) : (v == null ? '' : v);
+}
+function setLabel(id, text) {
+  const el = $(id);
+  if (el) el.textContent = text;
+}
+
 function collectConfig() {
   const f = $('cfgForm'), out = {};
   for (const [name, path] of Object.entries(CFG_MAP)) {
     const el = f.elements[name];
     if (!el) continue;
+    // 不提交用户看不见的字段：局域网开关在服务端部署下是隐藏的，提交它会在
+    // config.json 里塞进一个与宿主无关的 desktop_* 键。
+    if (el.closest('[hidden]')) continue;
     let v;
     if (el.type === 'checkbox') v = el.checked;
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
@@ -469,7 +556,16 @@ function collectConfig() {
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
-    if (v !== undefined) put(out, path, v);
+    if (v !== undefined) {
+      // 桌面模式的「监听端口」只收端口号，补回 listen 需要的 ":port" 形式，
+      // 这样磁盘上的配置仍是标准写法（服务端部署直接抄去也能用）。
+      if (name === 'listen' && cfgLoaded && cfgLoaded.desktop) {
+        const p = listenPort(v);
+        if (p) put(out, path, ':' + p);
+      } else {
+        put(out, path, v);
+      }
+    }
   }
   return out;
 }
@@ -506,6 +602,36 @@ $('btnEye').onclick = () => {
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
 $('btnCfgReload').onclick = loadConfig;
+
+/* 重新生成密钥（C）。
+ *
+ * 为什么重置后必须立刻把新密钥写进 localStorage：api_key 是热生效字段，服务端在
+ * 写盘那一刻就开始按新密钥鉴权，而本会话后续请求用的还是旧值 → 下一个轮询就 401。
+ * 所以这里拿到响应立刻覆盖本地存储，用户不用刷新页面。
+ *
+ * 按钮只在桌面版显示（服务端部署的密钥通常由部署方管理，不该在界面上一键换掉）。 */
+$('btnRerollKey').onclick = async () => {
+  if (!confirm('将生成一个新的访问密钥，旧密钥立即失效。\n\n' +
+               '已用旧密钥配置的客户端需要改成新密钥。确认继续？')) return;
+  const btn = $('btnRerollKey');
+  btn.disabled = true;
+  try {
+    const d = await api('config/reroll_key', { method: 'POST' });
+    const key = d.api_key || '';
+    localStorage.setItem(LS_KEY, key);       // 先让后续请求用新密钥
+    const el = $('cfgKey');
+    el.value = key;
+    el.type = 'text';                         // 让用户直接看到，便于抄走
+    $('btnEye').textContent = '隐藏';
+    $('rerollHint').textContent = '已重置，旧密钥已失效';
+    toast('新密钥已生成并生效', 'ok');
+  } catch (e) {
+    toast('重置失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
@@ -522,10 +648,26 @@ $('cfgForm').onsubmit = async ev => {
   try {
     const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
     const n = (r.restart_required || []).length;
-    toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
+    // 三种结局（宿主能力不同，如实说明，不统一成一句含糊的提示）：
+    //   有重启能力 + 有装配期改动 → 宿主马上会重建内核，页面稍后自行恢复
+    //   无重启能力 + 有装配期改动 → 用户得自己重启进程（服务端部署）
+    //   无装配期改动              → 已经生效，不用做任何事
+    let msg = '配置已保存并立即生效';
+    if (n && r.process_restarting) {
+      msg = '配置已保存，正在重启网关以应用 ' + n + ' 项改动…';
+    } else if (n) {
+      msg = '配置已保存，其中 ' + n + ' 项需重启进程生效';
+    }
+    toast(msg, 'ok');
     // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
     const k = $('cfgKey').value.trim();
     if (k) localStorage.setItem(LS_KEY, k);
+    if (n && r.process_restarting) {
+      // 内核要重建：端口可能变、页面里的连接会断。别再叠加轮询请求去撞正在关闭的
+      // 服务（只会刷出错提示），交给 checkAuthGate 探到恢复后再刷新。
+      waitForRestart();
+      return;
+    }
     loadConfig();
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
@@ -649,6 +791,28 @@ function start() {
   refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
 }
+
+// waitForRestart 保存触发了内核重建后的恢复流程。
+//
+// 不要切页面/重载：端口可能已经变了（内核重建时按可用端口重新分配），用旧地址
+// 重载只会得到一个连不上的错误页。这里的做法是「等旧地址重新答话」——桌面壳重建
+// 完内核后会主动把窗口导航到新地址，本页面被替换掉；若壳没有这个能力（或导航失败），
+// 旧地址恢复应答时这里也会继续正常轮询，页面自己恢复可用。
+function waitForRestart() {
+  stopPoll();
+  const tick = setInterval(async () => {
+    try { await api('overview'); }
+    catch (e) { return; }   // 还没起来（连接被拒 / 503）→ 继续等
+    clearInterval(tick);
+    start();                // 服务回来了：恢复轮询
+  }, 1000);
+  // 兜底：60 秒还没等到就放弃静默等待，让用户看到当前状态而不是永远卡住。
+  setTimeout(() => { clearInterval(tick); start(); }, 60000);
+}
+function stopPoll() {
+  if (refTimer) { clearInterval(refTimer); refTimer = null; }
+}
+
 async function checkAuthGate() {
   try { await api('overview'); }
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }

@@ -13,6 +13,7 @@ package panel
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -24,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/runtimepaths"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -47,9 +49,27 @@ type Config struct {
 	// nil 时配置页返回 501。
 	ConfigPath string
 	LoadConfig func() (any, error)
-	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
-	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
+	// SaveConfig 校验并落盘配置，返回**真的需要重启进程**才能生效的字段列表。
+	//
+	// 注意这个列表已经是「精确判定」的结果，不再是「按配置语义列举的装配期字段」：
+	// saveConfig 内部会拿合并后的新配置与运行中配置比较装配期字段，只有真的变了才返回
+	// 非空。判断逻辑在 appcore，面板不做 diff（它不该知道自己的宿主是什么形态）。
+	// error 时配置不写盘。
 	SaveConfig func(raw []byte) (restartRequired []string, err error)
+	// RestartProcess 让宿主重启进程/内核（桌面版：不退出应用地重建 Runtime）。
+	// nil = 不重启，仅由前端提示用户自行重启（服务端版本）。
+	//
+	// 调用时机：SaveConfig 已落盘并完成热应用之后，**异步**调用——重启会中断当前
+	// 这条 HTTP 响应，同步调用会让前端拿不到「已保存」的结果。
+	RestartProcess func()
+
+	// RotateAPIKey 重新生成 api_key：落盘 + 热应用，返回新密钥。
+	// nil = 该宿主不支持（接口返回 501）。
+	//
+	// 存在的意义：密钥是首启随机生成的，用户忘记后原本只能去翻 config.json。
+	// 重置后旧密钥立即失效（api_key 是热生效字段，无需重启），界面必须把新密钥
+	// 明确交付给用户，否则用户会把自己锁在门外。
+	RotateAPIKey func() (string, error)
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
@@ -61,6 +81,18 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ListenAddr 返回**实际**监听地址（如 127.0.0.1:7863），配置页据此显示请求地址。
+	//
+	// 不能用配置里的 listen：桌面版把 listen 只当"首选端口"，实际绑的是
+	// 回环/随机端口（见 appcore.Runtime.SetListenAddr）。显示配置值会给出一个
+	// 连不通的地址——比不显示更糟。宿主应在两种模式下都注入（服务端返回 cfg.Listen）。
+	ListenAddr func() string
+	// AllowLAN 返回当前是否允许局域网访问；配置页借此解释"局域网地址为何不可用"。nil = 否。
+	AllowLAN func() bool
+	// Desktop 桌面宿主标记。桌面版有"默认只绑回环"的语义，配置页据此三态解释局域网地址；
+	// 服务端部署不替用户猜对外地址。
+	Desktop bool
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -139,13 +171,14 @@ func New(cfg Config) *Panel {
 	return p
 }
 
-// Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
+// Logs 返回日志环形缓冲（由宿主经 logfmt.Tee 镜像 log 与 chat 表格日志进来）。
 func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.mux.HandleFunc("GET /panel/api/endpoints", p.withAuth(p.endpoints))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
@@ -180,6 +213,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("POST /panel/api/config/reroll_key", p.withAuth(p.rerollKey))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -241,9 +275,107 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
 }
 
-// models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
-// 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
+// endpoints 返回本机的请求地址信息，供配置页展示（用户不必再去翻日志）。
+//
+// 三态解释**局域网地址**，而不是笼统地报一个可能连不通的 IP：
+//
+//	桌面版 + 未开局域网 → 不可用，并说明去哪里打开（否则用户拿着地址连不上）
+//	桌面版 + 已开局域网 → 可用（绑了 0.0.0.0）
+//	服务端部署          → 可用（listen 是用户自己配的，他清楚绑了什么）
+//
+// localhost 一律给实际监听端口，而不是配置里的 listen：桌面版 ports 可能已回退。
+func (p *Panel) endpoints(w http.ResponseWriter, r *http.Request) {
+	addr := p.actualListenAddr()
+
+	// 从监听地址取端口；取不到时不编造端口。
+	_, port, err := net.SplitHostPort(addr)
+	hasPort := err == nil && port != ""
+
+	local := ""
+	if hasPort {
+		local = "http://127.0.0.1:" + port
+	}
+
+	out := map[string]any{
+		"localhost":     local,
+		"listen":        displayListen(p.actualListenAddr()),
+		"desktop":       p.isDesktop(),
+		"lan_enabled":   p.lanAllowed(),
+		"lan_ip":        "",
+		"lan_addr":      "",
+		"lan_available": false,
+		"lan_note":      "",
+		"api_base":      "",
+	}
+
+	// 兼容 OpenAI 的客户端要求 base_url 带 /v1。
+	if local != "" {
+		out["api_base"] = local + "/v1"
+	}
+
+	if !p.isDesktop() {
+		// 服务端：不替用户猜对外地址（可能是反代/域名/容器端口映射）。
+		out["lan_available"] = true
+		out["lan_note"] = "服务端部署：请按实际绑定的 listen 与网络环境填写"
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	if !p.lanAllowed() {
+		out["lan_note"] = "未开放：桌面版默认只允许本机访问，打开「允许局域网访问」并保存后会重启内核"
+		if ip := runtimepaths.LANIPv4(); ip != "" {
+			out["lan_ip"] = ip // 供用户预览"打开后会是这个地址"
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	ip := runtimepaths.LANIPv4()
+	if ip == "" {
+		out["lan_note"] = "已开放，但没找到可用的局域网地址（只有虚拟网卡或未连接网络）"
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out["lan_ip"] = ip
+	out["lan_available"] = true
+	if hasPort {
+		out["lan_addr"] = "http://" + ip + ":" + port
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// actualListenAddr 实际监听地址；宿主未注入时返回空串（不编造）。
+func (p *Panel) actualListenAddr() string {
+	if p.cfg.ListenAddr != nil {
+		return p.cfg.ListenAddr()
+	}
+	return ""
+}
+
+// isDesktop 是否桌面宿主（桌面版才有"只绑回环"的语义）。
+func (p *Panel) isDesktop() bool { return p.cfg.Desktop }
+
+// lanAllowed 是否允许局域网访问。
+func (p *Panel) lanAllowed() bool {
+	return p.cfg.AllowLAN != nil && p.cfg.AllowLAN()
+}
+
+// displayListen 把监听地址转成用户能看懂的写法。
+//
+// Go 对 0.0.0.0 的绑定会把 Addr() 报成 "[::]:7863"（双栈）——这对用户是无意义的
+// 噪音，且容易被误读成"IPv6 专用"。统一显示成 "0.0.0.0:7863"（所有网卡）。
+func displayListen(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return "0.0.0.0:" + port
+	}
+	return addr
+}
+
+// 与原实现同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
 // （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
