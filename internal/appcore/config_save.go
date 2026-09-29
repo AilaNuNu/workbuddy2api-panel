@@ -3,8 +3,8 @@
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval
-//   - schedule.* → Scheduler.Reconfigure / SetBalanceInterval
+//   - pool.* → SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring
+//   - schedule.* → Scheduler.Reconfigure / SetBalanceInterval / SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 // listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.ttl 等。
@@ -43,7 +43,7 @@ func saveConfig(raw []byte, path string, running *Config, live *livecfg.Holder, 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 	})
-	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
+	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -51,11 +51,15 @@ func saveConfig(raw []byte, path string, running *Config, live *livecfg.Holder, 
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
+		newCfg.Schedule.GrowthHours,
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
+		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
+		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 
 	// 5) 决定要不要让调用方去重启：只有装配期字段**真的变了**才算。
@@ -181,6 +185,8 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "upstash")
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	// 归档目录/保留策略在启动时固化为 reqlog 的装配期参数，改这些要重建内核。
+	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	return out
 }
 

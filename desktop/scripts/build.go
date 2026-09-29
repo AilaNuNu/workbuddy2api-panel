@@ -27,13 +27,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	appver "github.com/linguo2625469/workbuddy2api-panel/desktop/scripts/internal/version"
 )
 
 func main() {
 	debug := flag.Bool("debug", false, "保留控制台窗口（不设 -H windowsgui），便于看日志")
 	out := flag.String("o", "", "输出文件名（缺省 wb2api-desktop.exe）")
 	skipRes := flag.Bool("skip-res", false, "跳过 Windows 资源（exe 图标/版本信息）生成")
-	version := flag.String("version", "", "PE 资源里的版本号（缺省取 git tag）")
+	version := flag.String("version", "", "PE 资源里的版本号（缺省取源码 AppVersion，退回 git tag）")
 	flag.Parse()
 
 	// 定位 desktop 模块根：从当前目录向上找 go.mod。
@@ -54,12 +56,7 @@ func main() {
 	if runtime.GOOS == "windows" && !*skipRes {
 		ver := *version
 		if ver == "" {
-			if v, err := gitTagVersion(desktopDir); err == nil {
-				ver = v
-			} else {
-				ver = "0.0.0"
-				fmt.Printf("→ 未取到 git tag（%v），PE 资源版本用 %s\n", err, ver)
-			}
+			ver = appver.Resolve(desktopDir)
 		}
 		genWindowsResources(desktopDir, exeVersion(ver))
 	}
@@ -112,20 +109,6 @@ func findModuleRoot(start string) (string, error) {
 		}
 		dir = parent
 	}
-}
-
-// gitTagVersion 取最近的 git tag 并去掉 v 前缀（v1.11.6 → 1.11.6）。
-func gitTagVersion(dir string) (string, error) {
-	out, err := exec.Command("git", "describe", "--tags", "--abbrev=0").Output()
-	if err != nil {
-		return "", err
-	}
-	v := strings.TrimSpace(string(out))
-	v = strings.TrimPrefix(v, "v")
-	if v == "" {
-		return "", fmt.Errorf("git tag 为空")
-	}
-	return v, nil
 }
 
 // exeVersion 把 1.11.6 补成 4 段版本号（1.11.6.0）；Windows 的 PE 版本字段要 4 段。

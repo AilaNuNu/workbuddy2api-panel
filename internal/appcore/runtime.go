@@ -32,6 +32,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -41,7 +42,7 @@ import (
 
 // AppVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // 桌面壳与命令行入口共用同一版本号，避免回答用户时出现两个版本。
-const AppVersion = "1.11.6-panel"
+const AppVersion = "1.11.10-panel"
 
 // EntryConfig 两个入口（cmd/server 与桌面壳）共用的启动参数。
 type EntryConfig struct {
@@ -83,6 +84,8 @@ type Runtime struct {
 	Scheduler *scheduler.Scheduler
 	Panel     *panel.Panel
 	Usage     *usage.Recorder
+	// RequestLog 请求指标与脱敏 JSONL 归档（nil = 不记录）。
+	RequestLog *reqlog.Recorder
 
 	// RedisMode "upstash" / "noop"，透出到面板与日志。
 	RedisMode string
@@ -225,6 +228,8 @@ func (r *Runtime) build(entry EntryConfig) error {
 	r.Pool.SetSoftRateMax(cfg.SoftRateMaxDur)
 	r.Pool.SetCostExploreInterval(cfg.CostExploreIntervalDur)
 	r.Pool.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 快过期积分优先消耗（上游新增）。
+	r.Pool.SetPreferExpiring(cfg.Pool.PreferExpiring)
 
 	// 会话粘性路由（可配关闭）。
 	if cfg.SessionSticky.Enabled {
@@ -257,7 +262,7 @@ func (r *Runtime) build(entry EntryConfig) error {
 	}
 	// 聊天 SSE 流中空闲上限（空闲监控读取）。
 	r.Upstream.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	r.Upstream.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	r.Upstream.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	r.Upstream.UserAgent = cfg.Upstream.UserAgent
 	r.Upstream.ClientVersion = cfg.Upstream.ClientVersion
 	r.Upstream.CliVersion = cfg.Upstream.CliVersion
@@ -281,12 +286,14 @@ func (r *Runtime) build(entry EntryConfig) error {
 		ActivityHours:      cfg.Schedule.ActivityHours,
 		KeepaliveHours:     cfg.Schedule.KeepaliveHours,
 		BlackcatHours:      cfg.Schedule.BlackcatHours,
+		GrowthHours:        cfg.Schedule.GrowthHours,
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 	})
 	r.logScheduleConfig(cfg)
 
@@ -303,12 +310,28 @@ func (r *Runtime) build(entry EntryConfig) error {
 	r.Usage.Start()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, r.Usage.Describe())
 
+	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
+	r.RequestLog = reqlog.New(reqlog.Config{
+		Dir:           stateSibling(cfg.StateFile, "request-logs"),
+		Enabled:       cfg.Logging.RequestArchiveEnabled,
+		RetentionDays: cfg.Logging.RequestRetentionDays,
+		MaxBytes:      int64(cfg.Logging.RequestArchiveMaxMB) << 20,
+	})
+	rs := r.RequestLog.Snapshot().Archive
+	if rs.Enabled {
+		log.Printf("[reqlog] 请求指标已启用；JSONL 归档 %s（保留 %d 天，上限 %d MiB）",
+			rs.Dir, cfg.Logging.RequestRetentionDays, cfg.Logging.RequestArchiveMaxMB)
+	} else {
+		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
+	}
+
 	// 面板配置页的读写闭包：与命令行入口共用同一套 Load/saveConfig，
 	// 保证「面板保存」与「启动加载」永远走同一份校验逻辑。
 	cfgPath := r.ConfigPath
 	r.Panel = panel.New(panel.Config{
 		Pool:        r.Pool,
 		Usage:       r.Usage,
+		RequestLog:  r.RequestLog,
 		Upstream:    r.Upstream,
 		Scheduler:   r.Scheduler,
 		AuthDir:     cfg.AuthDir,
@@ -340,6 +363,10 @@ func (r *Runtime) build(entry EntryConfig) error {
 		RotateAPIKey: r.RotateAPIKey,
 	})
 
+	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
+	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
+	r.Scheduler.SetGrowthHook(r.Panel.RunGrowthQueueOnce)
+
 	// 日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进面板环形缓冲。
 	// 控制台输出行为完全不变；entry.LogWriter 非空时（桌面模式）额外落盘一份。
 	//
@@ -367,6 +394,7 @@ func (r *Runtime) build(entry EntryConfig) error {
 		Panel:         r.Panel,
 		Live:          r.live,
 		Usage:         r.Usage,
+		RequestLog:    r.RequestLog,
 		PromptMode:    cfg.Prompt.Mode,
 		PromptText:    cfg.PromptText,
 		GlobalEnabled: cfg.Global.Enabled,
@@ -464,6 +492,9 @@ func (r *Runtime) Close() {
 	}
 	if r.Usage != nil {
 		r.Usage.Stop()
+	}
+	if r.RequestLog != nil {
+		r.RequestLog.Close()
 	}
 	if r.Pool != nil {
 		// 最后一次 Flush → SaveState 已提交到 store，再关 store 才不会丢最后一笔镜像。

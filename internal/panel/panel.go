@@ -25,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/runtimepaths"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -76,6 +77,8 @@ type Config struct {
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
+	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
+	RequestLog *reqlog.Recorder
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -180,6 +183,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/endpoints", p.withAuth(p.endpoints))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
+	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
@@ -199,8 +204,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
-	p.mux.HandleFunc("GET /panel/api/school/status", p.withAuth(p.schoolStatus))
-	p.mux.HandleFunc("POST /panel/api/school/run_all", p.withAuth(p.schoolRunAll))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
@@ -242,6 +245,14 @@ func (p *Panel) apiKey() string {
 		return p.cfg.Live.Load().APIKey
 	}
 	return p.cfg.APIKey
+}
+
+// expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
+func (p *Panel) expiringSoonWindow() time.Duration {
+	if p.cfg.Scheduler == nil {
+		return 0
+	}
+	return p.cfg.Scheduler.ExpiringSoonWindow()
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +386,45 @@ func displayListen(addr string) string {
 	return addr
 }
 
-// 与原实现同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
+// requestMetrics 返回进程内请求指标、最近 100 条与归档状态。
+func (p *Panel) requestMetrics(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RequestLog == nil {
+		writeErr(w, http.StatusNotImplemented, "request logger not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, p.cfg.RequestLog.Snapshot())
+}
+
+// requestLogs 从 JSONL 归档读取最近请求；limit 默认 200、最大 1000。
+func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RequestLog == nil {
+		writeErr(w, http.StatusNotImplemented, "request logger not available")
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
+		Outcome: r.URL.Query().Get("outcome"),
+		Account: r.URL.Query().Get("account"),
+		Model:   r.URL.Query().Get("model"),
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
+}
+
+// models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
+// 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
+// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
 // （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
@@ -555,27 +604,37 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checkinMsg := ""
+	checkinDone := false
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
+		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
+		if upstream.IsAlreadyCheckin(err) {
+			p.cfg.Pool.NoteCheckinDone(uid)
+			checkinDone = true
+		}
+	} else {
+		p.cfg.Pool.NoteCheckinDone(uid)
+		checkinDone = true
 	}
-	resp := map[string]any{"ok": true}
+	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// accountBalance 单号余额刷新：UserResource → SetCredits（不触碰冷却状态）。
+// accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -583,12 +642,12 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain, total)
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
@@ -704,7 +763,11 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 			nicks[s.UID] = s.Nickname
 		}
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+	var currentRate func(realm, model string) string
+	if p.cfg.Upstream != nil {
+		currentRate = p.cfg.Upstream.ModelRate
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWithRates(hours, nicks, currentRate))
 }
 
 // usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。

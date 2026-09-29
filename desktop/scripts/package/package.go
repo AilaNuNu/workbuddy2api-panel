@@ -25,14 +25,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	appver "github.com/linguo2625469/workbuddy2api-panel/desktop/scripts/internal/version"
 )
 
-// 版本号：优先取 git tag（vX.Y.Z → X.Y.Z），取不到时用下面的兜底值。
-//
-// 为什么不让用户手填：版本号散落在三个地方（面板 AppVersion、安装包文件名、
-// NSIS 的 VIProductVersion），手工同步迟早写歪——曾出现 .nsi 里硬编码成旧值的情况。
-// tag 是唯一可信来源，CI/本地打包都不用记版本号。
-const defaultVersion = "1.11.6"
+// 版本号由 internal/version 统一决定（源码 AppVersion → git tag → 兜底），
+// 这里只留一个「没显式传 -version 时」的占位默认值。
+const defaultVersion = appver.Fallback
 
 func main() {
 	version := flag.String("version", defaultVersion, "安装包版本号（缺省取 git tag）")
@@ -54,14 +53,10 @@ func main() {
 		fail(err)
 	}
 
-	// 没显式给 -version 时用 git tag。
+	// 没显式给 -version 时按统一规则解析。
 	if !flagWasSet("version") {
-		if v, err := gitTagVersion(desktopDir); err == nil {
-			version = &v
-			fmt.Printf("→ 版本号取自 git tag：%s\n", v)
-		} else {
-			fmt.Printf("→ 未取到 git tag（%v），用兜底版本 %s\n", err, *version)
-		}
+		v := appver.Resolve(desktopDir)
+		version = &v
 	}
 
 	iconPath := filepath.Join(desktopDir, "assets", "tray.ico")
@@ -132,22 +127,6 @@ func flagWasSet(name string) bool {
 		}
 	})
 	return set
-}
-
-// gitTagVersion 取最近的 git tag 并去掉 v 前缀（v1.11.6 → 1.11.6）。
-//
-// 与 build.go 里同名函数各留一份，理由同 findModuleRoot：不同 package main 无法互相引用。
-func gitTagVersion(dir string) (string, error) {
-	out, err := exec.Command("git", "describe", "--tags", "--abbrev=0").Output()
-	if err != nil {
-		return "", err
-	}
-	v := strings.TrimSpace(string(out))
-	v = strings.TrimPrefix(v, "v")
-	if v == "" {
-		return "", fmt.Errorf("git tag 为空")
-	}
-	return v, nil
 }
 
 // exeVersion 把 1.11.6 补成 4 段版本号（1.11.6.0）；Windows 的 PE 版本字段要 4 段。
