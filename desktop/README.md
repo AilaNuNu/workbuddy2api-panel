@@ -28,10 +28,22 @@ go install github.com/tc-hib/go-winres@latest
 
 ```bash
 cd desktop
-go run ./scripts/package                 # 构建 exe → 打安装包 → dist/wb2api-desktop-<版本>-setup.exe
+go run ./scripts/package                 # 构建 exe → 安装包 + 便携版 zip → dist/
 go run ./scripts/package -version 1.11.7 # 显式指定版本号（覆盖自动解析）
-go run ./scripts/package -skip-build     # 复用已构建的 exe，不重新编译
+go run ./scripts/package -skip-build     # 复用已构建的 exe，不重新打包 exe
+go run ./scripts/package -no-zip         # 只出安装包，不出便携版 zip
 ```
+
+产出两个文件（都在 `dist/`，已 gitignore）：
+
+| 文件 | 说明 |
+|---|---|
+| `wb2api-desktop-<版本>-setup.exe` | NSIS 安装包，约 5.3 MiB |
+| `wb2api-desktop-<版本>-portable.zip` | 免安装版，约 7.4 MiB |
+
+**发布前请从干净的已提交状态构建。** Go 会把当前 commit 与工作树是否脏嵌进二进制
+（`go version -m` 可见 `...+dirty`），脏树构建出来的产物带 `+dirty` 戳、对不上任何
+提交号。代码本身是确定性的：同一状态下连续构建，产物逐字节一致。
 
 版本号从**源码单一来源**解析：`internal/appcore/runtime.go` 的 `AppVersion` 常量
 （剥掉 `-panel` 之类后缀）→ 退回 git tag → 再退回兜底常量。四处使用者
@@ -119,6 +131,15 @@ powershell "(Get-Item 'D:\WorkBuddy2API\wb2api-desktop.exe').VersionInfo | Forma
 一个容易踩的坑：便携版通过 `Run-Portable.cmd` 设 `WB2A_DATA_DIR=%~dp0data` 指向自己
 的文件夹，但**直接双击便携版目录里的 exe 不会经过它** —— 那会去找
 `%APPDATA%\WorkBuddy2API`，也就是安装版的数据。
+
+### 免安装版 zip 里有什么
+
+只有两个文件：`wb2api-desktop.exe` + `Run-Portable.cmd`。**不含任何 `data/` 或
+`config.json`** —— 首次运行自动生成。删除解压出来的整个文件夹即无残留。
+
+zip 由 `scripts/package` 用「逐个文件加入」的方式组装（`makePortableZip`），
+**不遍历目录**。这不是洁癖：开发机上的便携版目录里往往已有 `data/`（含真实账号凭证），
+「压缩整个文件夹」会把凭证打进公开发布的产物，且不可逆。
 
 
 ## 使用

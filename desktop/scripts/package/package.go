@@ -18,8 +18,10 @@
 package main
 
 import (
+	"archive/zip"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +39,7 @@ func main() {
 	version := flag.String("version", defaultVersion, "安装包版本号（缺省取源码 AppVersion，退回 git tag）")
 	skipBuild := flag.Bool("skip-build", false, "跳过 exe 构建，直接打已有的二进制")
 	makensisFlag := flag.String("makensis", "", "makensis 可执行文件路径（缺省自动查找）")
+	noZip := flag.Bool("no-zip", false, "不产出免安装版 zip（只要安装包时用）")
 	flag.Parse()
 
 	if runtime.GOOS != "windows" {
@@ -116,6 +119,88 @@ func main() {
 		outPath, float64(pst.Size())/(1<<20), float64(st.Size())/(1<<20))
 	fmt.Println("   双击安装（按用户安装，不弹 UAC）。")
 	fmt.Println("   开机自启在托盘菜单里开关；卸载器会清掉对应的自启项。")
+
+	if !*noZip {
+		if err := makePortableZip(desktopDir, filepath.Dir(outPath), *version, exePath); err != nil {
+			fail(fmt.Errorf("打便携版 zip 失败: %w", err))
+		}
+	}
+}
+
+// makePortableZip 组装免安装版 zip：只有 exe + 启动脚本两个文件。
+//
+// 关键：**逐个 os.Open 加入，绝不遍历现成目录**。开发机上的便携版目录里往往已有
+// data/（含真实账号凭证），用「压缩整个文件夹」的写法会把凭证打进公开发布的 zip——
+// 这是不可逆的泄漏。逐个文件列出是唯一安全的做法。
+//
+// 空目录也不打包：每个条目自带内容，解压即用。用户首次运行由 exe 自动生成
+// data/ 与随机 api_key。
+func makePortableZip(desktopDir, distDir, version, exePath string) error {
+	launcher := filepath.Join(desktopDir, "portable", "Run-Portable.cmd")
+	entries := []struct{ src, name string }{
+		{exePath, filepath.Base(exePath)},
+		{launcher, filepath.Base(launcher)},
+	}
+	for _, e := range entries {
+		if _, err := os.Stat(e.src); err != nil {
+			return fmt.Errorf("缺少 %s: %w", e.src, err)
+		}
+	}
+
+	zipName := fmt.Sprintf("wb2api-desktop-%s-portable.zip", version)
+	zipPath := filepath.Join(distDir, zipName)
+	// 0600：内容含可执行文件，没必要让其它用户可读。
+	f, err := os.OpenFile(zipPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+
+	for _, e := range entries {
+		src, err := os.Open(e.src)
+		if err != nil {
+			return err
+		}
+		st, err := src.Stat()
+		if err != nil {
+			src.Close()
+			return err
+		}
+		hdr := &zip.FileHeader{Name: e.name, Method: zip.Deflate, Modified: st.ModTime()}
+		// 只给 exe 打可执行位；.cmd 在 Windows 上靠扩展名即可。
+		if strings.HasSuffix(e.name, ".exe") {
+			hdr.SetMode(0o755)
+		} else {
+			hdr.SetMode(0o644)
+		}
+		w, err := zw.CreateHeader(hdr)
+		if err != nil {
+			src.Close()
+			return err
+		}
+		if _, err := io.Copy(w, src); err != nil {
+			src.Close()
+			return err
+		}
+		src.Close()
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	zst, err := os.Stat(zipPath)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✅ %s  (%.1f MiB，含 %d 个文件：%s + %s)\n",
+		zipPath, float64(zst.Size())/(1<<20), len(entries),
+		filepath.Base(exePath), filepath.Base(launcher))
+	fmt.Println("   解压即用；首次运行自动生成 data/ 与随机 api_key。")
+	fmt.Println("   注意：zip 内**不含**任何 data/ 或 config.json。")
+	return nil
 }
 
 // flagWasSet 判断某个 flag 是否被显式传入（区分「没传」与「传了默认值」）。
