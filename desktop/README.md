@@ -15,14 +15,32 @@ go run ./scripts/build.go -debug   # 保留控制台窗口，调试图标/启动
 （Windows 11 自带；Win10 可能需要装 Evergreen Runtime）、Node 仅 Wails CLI 需要，
 本仓库的构建脚本直接调 `go build`，**不需要 Node**。
 
+Windows 上还需要 `go-winres`（生成 exe 图标与版本信息的 `.syso`）：
+
+```bash
+go install github.com/tc-hib/go-winres@latest
+```
+
+缺了它会**直接终止构建**（不是静默跳过一个没图标的 exe）；临时跳过用
+`go run ./scripts/build.go -skip-res`，代价是 exe 保持上一次的图标与版本资源。
+
 ## 打安装包（Windows）
 
 ```bash
 cd desktop
 go run ./scripts/package                 # 构建 exe → 打安装包 → dist/wb2api-desktop-<版本>-setup.exe
-go run ./scripts/package -version 1.11.7 # 指定版本号（默认 1.11.6）
+go run ./scripts/package -version 1.11.7 # 显式指定版本号（覆盖自动解析）
 go run ./scripts/package -skip-build     # 复用已构建的 exe，不重新编译
 ```
+
+版本号从**源码单一来源**解析：`internal/appcore/runtime.go` 的 `AppVersion` 常量
+（剥掉 `-panel` 之类后缀）→ 退回 git tag → 再退回兜底常量。四处使用者
+（面板自报版本、安装包文件名、NSIS 的 `VIProductVersion`、exe 的 PE 资源）都取这一个值。
+
+> 不要用 git tag 当首选：tag 是在版本号 bump 提交**之后**才打的，bump 落地但尚未打
+> tag 时 tag 会落后一档（实测源码已 `1.11.10-panel`，最新 tag 仍 `v1.11.9` → 只按 tag
+> 打包会产出比面板自报版本还旧的安装包）。解析逻辑在 `scripts/internal/version`，两个
+> 脚本共用一份实现。
 
 需要 NSIS（`winget install NSIS.NSIS`）。脚本按 `PATH` → `C:\Program Files (x86)\NSIS`
 → `D:\Tools\nsis` 的顺序自动查找 `makensis`，找不到会给出装法。
@@ -38,6 +56,70 @@ go run ./scripts/package -skip-build     # 复用已构建的 exe，不重新编
   勾选会造出第二处写同一注册表值的地方，两边逻辑一旦分叉就是「装完显示已勾但没生效」。
 
 卸载：`%LOCALAPPDATA%\Programs\WorkBuddy2API\uninstall.exe`，或控制面板「应用和功能」。
+
+## 覆盖安装与升级
+
+**直接双击新的 `setup.exe` 即可**，不要先卸载。覆盖安装不会动用户数据。
+
+保证来自这三处（改动任何一处都要同步检查）：
+
+| # | 机制 | 位置 |
+|---|---|---|
+| 1 | 安装脚本只写程序目录与注册表，**从不触碰数据目录** | `nsis/wb2api-desktop.nsi` |
+| 2 | 首次生成配置用 `O_EXCL` **原子拒绝覆盖** | `internal/appcore/config.go` 的 `WriteDefault` |
+| 3 | 只有 `fs.ErrNotExist` 才生成新配置 | `internal/appcore/runtime.go` 的 `loadOrGenerate` |
+
+沿用原安装目录：`.onInit` 读 `HKCU\Software\WorkBuddy2API` 的 `InstallDir`，所以不会
+装出第二份。
+
+### 升级前
+
+1. **手动退出正在跑的实例**（托盘 → 退出），不要依赖安装器的 `taskkill /F`。
+   那是强杀，会跳过优雅停机（`app.Close()` → `pool.Flush()`）；万一此刻有账号状态
+   变更，最后一次落盘可能丢。`state.json` 本身是「先写 tmp 再 rename」的原子替换，
+   不存在写到一半变空文件的情形。
+2. **备份数据目录**：
+
+   ```cmd
+   xcopy /E /I /Y "%APPDATA%\WorkBuddy2API" "%USERPROFILE%\Desktop\wb2a-backup"
+   ```
+
+   不是怕安装包删数据，而是怕**手滑走卸载**：卸载器会弹一次「是否删除用户数据」，
+   默认虽为「否」（`/SD IDNO`），但一次确认挡不住点错。3 个账号的凭证重新获取是有
+   成本的。
+
+### 升级后怎么确认真的没出问题
+
+「面板能打开、版本号对」**不足以**证明升级正确 —— 版本号只是界面上的一个字符串。
+至少核对这几项：
+
+```cmd
+:: 1) 数据完好：账号数、api_key 指纹、逐文件哈希
+python D:\Tools\uitest\verify_after_install.py
+
+:: 2) 装的是新 exe：与构建产物的 sha256 一致
+certutil -hashfile "D:\WorkBuddy2API\wb2api-desktop.exe" SHA256
+
+:: 3) PE 版本资源（右键属性 → 详细信息，或）
+powershell "(Get-Item 'D:\WorkBuddy2API\wb2api-desktop.exe').VersionInfo | Format-List"
+```
+
+不打印密钥值。`auths/*.json` 与 `config.json` 的内容一致才叫没问题；
+`state.json` / `usage.json` / 日志**本来就会变**（运行时持续写入），不算异常。
+**`api_key` 一旦被换，所有已用旧密钥配置的客户端会立刻全部 401**，这是最需要盯的一项。
+
+> `verify_after_install.py` 属于开发机上的临时工具（在 `D:\Tools\uitest\`，不在仓库里）。
+> 没有它也能手工核对：比 `config.json` 与 `auths/` 的文件时间戳和账号数量即可。
+
+### 数据目录不跟着安装目录走
+
+用户数据固定在 `%APPDATA%\WorkBuddy2API`（或 `WB2A_DATA_DIR`），与装在哪无关。
+所以把数据目录整体搬走、或在别的机器上恢复，都不需要重装。
+
+一个容易踩的坑：便携版通过 `Run-Portable.cmd` 设 `WB2A_DATA_DIR=%~dp0data` 指向自己
+的文件夹，但**直接双击便携版目录里的 exe 不会经过它** —— 那会去找
+`%APPDATA%\WorkBuddy2API`，也就是安装版的数据。
+
 
 ## 使用
 
@@ -73,9 +155,13 @@ go run ./scripts/package -skip-build     # 复用已构建的 exe，不重新编
   点击托盘图标切换窗口显示与隐藏。开机自启写 `HKCU\...\Run` 下的 `workbuddy2api`
   项（值名 = Wails 的 slug，必须与安装包卸载器删的名字一致，否则会留下孤儿启动项）。
 - **配置保存后自动重启**：面板「配置」页保存了装配期字段（`listen`、`auth_dir`、
-  `upstream.*`、`session_sticky.*`）时，桌面壳会**自动重建内核**并把窗口导航到新地址，
-  不需要用户去托盘点「重启网关」。只改热生效字段（`api_key`、`pool.*`、`schedule.*`）
-  则不会重启。
+  `upstream.*`、`session_sticky.*`、`logging.*`）时，桌面壳会**自动重建内核**并把窗口
+  导航到新地址，不需要用户去托盘点「重启网关」。只改热生效字段（`api_key`、`pool.*`、
+  `schedule.*`、`features.*`）则不会重启。
+- **请求归档开关**：配置页「上游与高级」里的「请求日志归档」控制上游新增的 JSONL 归档
+  （只存脱敏元数据，不含对话内容）。它在 `internal/reqlog` 里是启动期参数（无运行时重
+  配置 API），所以改动走「需重启 → 自动重建内核」。关掉归档不影响「请求指标」（内存
+  统计，始终启用）。
 - **单实例**：第二次双击不会起新进程，而是把已有窗口叫出来。两个实例会争同一个
   `state.json` 并抢端口，必须挡住。
 - **日志**：GUI 程序没有控制台，所有日志落 `workbuddy2api.log`。用户报故障时
@@ -110,16 +196,23 @@ desktop/
   main.go         桌面壳：窗口 / 托盘 / 单实例 / 关闭对话框 / 开机自启 / 重启
   logfile.go      落盘日志（环形截断）
   autostart_test.go 开机自启的注册表往返测试（真实读写 HKCU\...\Run，用测试专用项名）
+  wb2api-desktop.syso  **自动生成**（go-winres 产出，已 gitignore）：
+                  PE 资源段里的 exe 图标 + 版本信息 + GUI manifest
   assets/
-    tray.ico      托盘与应用图标（多尺寸 16→256）
+    tray.ico      托盘与应用图标（多尺寸 16→256）。同时也是 exe 与安装包图标的源
     app.png       透明底应用图标（安装包/文档用）
   nsis/
     wb2api-desktop.nsi  安装包脚本（UTF-8 **带 BOM**，否则 makensis 按 ACP 读会乱码）
   scripts/
-    build.go      构建脚本（windowsgui ldflags + 体积报告）
+    build.go      构建脚本（windowsgui ldflags + 生成 .syso + 体积报告）
     package/      安装包脚本（单独目录：与 build.go 同为 package main，同目录会 main 重定义）
+    internal/version/  版本号解析（两个 package main 无法互相 import，抽成共享包）
   dist/           安装包输出（已 gitignore）
 ```
+
+图标有三处使用者，缺一不可：**exe 的 PE 资源段**（资源管理器/任务栏/Alt-Tab 读它）、
+**安装包**（NSIS `MUI_ICON`）、**托盘**（`go:embed`）。`go:embed` 只管托盘——只换
+`tray.ico` 而不生成 `.syso` 的话，exe 会看起来「改了但没变」。
 
 ## 已知限制
 

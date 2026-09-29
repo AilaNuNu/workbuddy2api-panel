@@ -34,7 +34,7 @@ import (
 const defaultVersion = appver.Fallback
 
 func main() {
-	version := flag.String("version", defaultVersion, "安装包版本号（缺省取 git tag）")
+	version := flag.String("version", defaultVersion, "安装包版本号（缺省取源码 AppVersion，退回 git tag）")
 	skipBuild := flag.Bool("skip-build", false, "跳过 exe 构建，直接打已有的二进制")
 	makensisFlag := flag.String("makensis", "", "makensis 可执行文件路径（缺省自动查找）")
 	flag.Parse()
