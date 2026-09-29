@@ -941,6 +941,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
+            <div class="hr"></div>
+            <!-- 请求归档（logging.*）：上游只在 Go 侧实现了字段，这里补上面板开关。
+                 归档目录/保留策略在启动时固化为 reqlog 的装配期参数 → 改这三项需重启内核。 -->
+            <div class="switch"><span class="lb">请求日志归档</span>
+              <input type="checkbox" name="request_archive_enabled"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">归档保留天数</span>
+                <input name="request_retention_days" type="number" min="1" placeholder="7">
+                <span class="hint">只留脱敏元数据，不含对话内容</span></label>
+              <label class="fld"><span class="lb">归档容量上限（MiB）</span>
+                <input name="request_archive_max_mb" type="number" min="1" placeholder="100">
+                <span class="hint">超出后按时间裁剪旧文件</span></label>
+            </div>
+            <div class="hint">关闭归档不影响「请求指标」（内存统计，始终启用）。改动需重启进程。</div>
           </div>
         </div>
 

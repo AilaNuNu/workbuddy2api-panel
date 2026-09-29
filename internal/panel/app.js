@@ -538,6 +538,10 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  // 请求归档三件套。reqlog 没有运行时重配置 API，故都是装配期字段（保存后需重启内核，桌面版自动重建）。
+  request_archive_enabled: ['logging', 'request_archive_enabled'],
+  request_retention_days: ['logging', 'request_retention_days'],
+  request_archive_max_mb: ['logging', 'request_archive_max_mb'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -562,6 +566,7 @@ async function loadConfig() {
       else el.value = v == null ? '' : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
+    applyCfgDeps();       // 按回填后的开关状态置灰从属输入
     $('cfgNote').textContent = '';
     loadEndpoints();
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
@@ -701,8 +706,23 @@ function markDurationFields() {
     el.title = bad ? DURATION_TIP : '';
   }
 }
+/* 控件依赖显隐：开关关掉时其从属数值输入置灰。'disabled' 而非 hidden——
+   collectConfig 只跳过 [hidden]，disabled 控件读出的 value 为空、按 undefined 跳过，磁盘原值得以保留。 */
+const cfgDependsOn = {
+  request_retention_days: 'request_archive_enabled',
+  request_archive_max_mb: 'request_archive_enabled',
+};
+function applyCfgDeps() {
+  const f = $('cfgForm');
+  for (const [name, owner] of Object.entries(cfgDependsOn)) {
+    const el = f.elements[name], ow = f.elements[owner];
+    if (!el || !ow) continue;
+    el.disabled = !ow.checked;
+  }
+}
 $('cfgForm').addEventListener('input', ev => {
   if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
+  if (cfgDependsOn[ev.target.name] || Object.values(cfgDependsOn).includes(ev.target.name)) applyCfgDeps();
 });
 $('btnEye').onclick = () => {
   const el = $('cfgKey');
