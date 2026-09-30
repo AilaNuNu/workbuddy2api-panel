@@ -605,6 +605,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
+	freshCheckin := false
+	// 记录发起签到的时刻：签到后据它从余额批次里筛出本次新增的发放
+	// （上游每个包带 CreateTime + grantSource=daily_checkin）。
+	checkinAt := time.Now()
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
@@ -615,22 +619,34 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.cfg.Pool.NoteCheckinDone(uid)
 		checkinDone = true
+		freshCheckin = true
 	}
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	grants, err := p.cfg.Upstream.UserResourceDetailedGrants(a, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	p.cfg.Pool.ReenableIfCredits(uid, grants.Remain, grants.Total)
+	p.cfg.Pool.SetCreditsDetailed(uid, grants.Remain, grants.Total, grants.Expiring, grants.EarliestAt, grants.EarliestRemaining)
+	resp["credits"] = grants.Remain
+	resp["credits_total"] = grants.Total
+	// 本次签到新增的发放额度。仅在「确实是本次新签」且观测到新批次时才给这个字段：
+	//   - 幂等路径（今天已签到）本来就没有新发放，给 0 会让前端显示「本次 +0」；
+	//   - 新签但未观测到新批次（上游改了发放口径）同理。
+	// 两种情况下前端都退化为只报余额，不宣称得分 —— 宁可不显示，也不报一个假的 0。
+	if freshCheckin {
+		reward, n := upstream.SumGrantsSince(grants.Grants, "daily_checkin", checkinAt)
+		if n > 0 {
+			resp["checkin_reward"] = reward
+			resp["checkin_reward_batches"] = n
+		}
+	}
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, grants.Remain, grants.Total)
 	writeJSON(w, http.StatusOK, resp)
 }
 

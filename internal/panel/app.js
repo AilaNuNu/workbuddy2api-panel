@@ -292,7 +292,11 @@ $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      // 本次得分只在服务端确实观测到新发放时才存在（幂等路径没有），
+      // 未观测到就只说余额，不显示「+0」。
+      const got = (r.checkin_reward != null ? '，本次 +' + r.checkin_reward + ' 积分' : '');
+      const bal = (r.credits != null ? '，余额 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '');
+      toast('签到完成' + got + bal + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');

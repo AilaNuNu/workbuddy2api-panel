@@ -1928,10 +1928,55 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 	return remain, total, expiring, err
 }
 
+// attrKV 上游 AccountAttributes 的 {Key,Value,Type} 三元组（只用前两项）。
+type attrKV struct {
+	Key   string `json:"Key"`
+	Value string `json:"Value"`
+}
+
+// CreditGrant 一个积分批次的「发放来源」视图（回答「签到得了多少分」的事实来源）。
+//
+// 来源取自上游 AccountAttributes 的 grantSource（实测值：daily_checkin 签到发放、
+// growth_travel 猫猫旅行）。CreateTime 是发放时刻（epoch 毫秒），配合「签到开始时刻」
+// 即可定位本次签到新增的批次。
+type CreditGrant struct {
+	GrantSource  string    // "daily_checkin" / "growth_travel" / ""（来源未知）
+	PackageName  string    // 套餐名，便于日志里辨认
+	CreatedAt    time.Time // 发放时刻（上游未给则为零值）
+	CapacitySize int64     // 该批次总额
+	Remain       int64     // 该批次剩余
+}
+
+// CreditGrants 一次余额查询的完整结果：聚合值 + 逐批次明细。
+//
+// 为什么把明细一次带出来：签到后既要知道「本次得分」又要刷新余额，若为此再发一次请求，
+// 既多一次上游调用，两次快照还可能不一致（期间发生扣费）。
+type CreditGrants struct {
+	Remain            int64 // 可用总余额
+	Total             int64 // 总额
+	Expiring          int64 // 窗口内将过期的量
+	EarliestAt        time.Time
+	EarliestRemaining int64
+	Grants            []CreditGrant // 逐批次明细（顺序同上游返回）
+}
+
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
 // earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
 // 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
+//
+// 保留此签名的原因：调用方（面板 2 处、排程 2 处、UserResourceDetailed、2 个测试）
+// 只关心聚合值。需要批次明细的走 UserResourceDetailedGrants。
 func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	g, err := c.UserResourceDetailedGrants(a, soon)
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
+	}
+	return g.Remain, g.Total, g.Expiring, g.EarliestAt, g.EarliestRemaining, nil
+}
+
+// UserResourceDetailedGrants 是 UserResourceDetailedWithExpiry 的完整版本：除聚合值外
+// 还返回逐批次发放明细（来源/发放时刻/额度/剩余），供「本次签到得了多少分」这类归因使用。
+func (c *Client) UserResourceDetailedGrants(a *auth.Auth, soon time.Duration) (CreditGrants, error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1944,33 +1989,36 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
-	err = c.retryBillingTransient(func() error {
+	err := c.retryBillingTransient(func() error {
 		var e error
 		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 		return e
 	})
 	if err != nil {
-		return 0, 0, 0, time.Time{}, 0, err
+		return CreditGrants{}, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
 				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+					PackageName         string   `json:"PackageName"`
+					CycleEndTime        string   `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+					CapacitySize        int64    `json:"CapacitySize"`
+					CapacityRemain      int64    `json:"CapacityRemain"`
+					CapacityUsed        int64    `json:"CapacityUsed"`
+					CycleCapacitySize   int64    `json:"CycleCapacitySize"`
+					CycleCapacityRemain int64    `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   int64    `json:"CycleCapacityUsed"`
+					CreateTime          int64    `json:"CreateTime"` // epoch 毫秒
+					AccountAttributes   []attrKV `json:"AccountAttributes"`
 				} `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
+		return CreditGrants{}, fmt.Errorf("resource parse: %w", err)
 	}
+	var out CreditGrants
 	for _, acct := range resp.Response.Data.Accounts {
 		r, _, size := packageRemainUsed(respAccount{
 			CapacityRemain:      acct.CapacityRemain,
@@ -1986,8 +2034,20 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		if size < r {
 			size = r
 		}
-		remain += r
-		total += size
+		out.Remain += r
+		out.Total += size
+		// 批次明细：剩余为 0 也收 —— 「刚发放就被扣完」同样应当可见。
+		g := CreditGrant{
+			PackageName:  acct.PackageName,
+			CapacitySize: size,
+			Remain:       r,
+			GrantSource:  grantSourceOf(acct.AccountAttributes),
+		}
+		if acct.CreateTime > 0 {
+			g.CreatedAt = time.UnixMilli(acct.CreateTime)
+		}
+		out.Grants = append(out.Grants, g)
+
 		if r <= 0 {
 			continue
 		}
@@ -1995,18 +2055,53 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		if !ok || !end.After(now) {
 			continue
 		}
-		if earliestAt.IsZero() || end.Before(earliestAt) {
-			earliestAt = end
-			earliestRemaining = r
-		} else if end.Equal(earliestAt) {
-			earliestRemaining += r
+		if out.EarliestAt.IsZero() || end.Before(out.EarliestAt) {
+			out.EarliestAt = end
+			out.EarliestRemaining = r
+		} else if end.Equal(out.EarliestAt) {
+			out.EarliestRemaining += r
 		}
 		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
 		if soon > 0 && !end.After(now.Add(soon)) {
-			expiring += r
+			out.Expiring += r
 		}
 	}
-	return remain, total, expiring, earliestAt, earliestRemaining, nil
+	return out, nil
+}
+
+// grantSourceOf 从 AccountAttributes 里取 grantSource（发放来源标记）。
+// 缺失时返回空串 —— 调用方按"来源未知"处理，不要猜。
+func grantSourceOf(attrs []attrKV) string {
+	for _, a := range attrs {
+		if a.Key == "grantSource" {
+			return a.Value
+		}
+	}
+	return ""
+}
+
+// SumGrantsSince 汇总 grants 中「来源匹配 source 且发放时刻不早于 since」的额度。
+//
+// since 应传**发起签到请求之前**的时刻（而非响应之后）—— 上游 CreateTime 是发放瞬间，
+// 必然落在请求窗口内。留 2 分钟容差吸收本机与上游的时钟偏差，避免刚发放的批次因
+// 毫秒级时钟差被判为"不是本次的"而漏报。
+//
+// 抽成纯函数便于单测（不需要真调上游）。返回 (额度合计, 批次数)。
+func SumGrantsSince(grants []CreditGrant, source string, since time.Time) (int64, int) {
+	cutoff := since.Add(-2 * time.Minute)
+	var total int64
+	var n int
+	for _, g := range grants {
+		if g.GrantSource != source {
+			continue
+		}
+		if g.CreatedAt.IsZero() || g.CreatedAt.Before(cutoff) {
+			continue
+		}
+		total += g.CapacitySize
+		n++
+	}
+	return total, n
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

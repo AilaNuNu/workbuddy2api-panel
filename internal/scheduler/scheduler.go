@@ -439,6 +439,11 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
+		// 记录「发起签到」的时刻：签到后据它从余额批次里筛出**本次**新增的发放
+		// （上游每个包带 CreateTime + grantSource=daily_checkin）。必须在请求之前取时刻，
+		// 否则响应耗时会把发放时刻推到窗口之外而漏报。
+		checkinAt := time.Now()
+		freshCheckin := false
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
@@ -452,16 +457,33 @@ func (s *Scheduler) RunCheckinNow() {
 			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
 			// 重复触发时出现），成功也落一行。
 			s.cfg.Pool.NoteCheckinDone(st.UID)
-			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+			freshCheckin = true
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+		// 用 Grants 版本一次拿到聚合值 + 批次明细，避免为「本次得分」多发一次请求。
+		grants, err := s.cfg.Upstream.UserResourceDetailedGrants(a, expiringSoon)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			if freshCheckin {
+				// 余额查询失败不影响「签到成功」这个事实，只是说不出得分。
+				log.Printf("checkin %s: 签到成功（本次得分未知：余额查询失败）", logfmt.Label(st.UID, st.Nickname))
+			}
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		if freshCheckin {
+			reward, n := upstream.SumGrantsSince(grants.Grants, "daily_checkin", checkinAt)
+			if n > 0 {
+				log.Printf("checkin %s: 签到成功，本次 +%d 积分（余额 %d/%d）",
+					logfmt.Label(st.UID, st.Nickname), reward, grants.Remain, grants.Total)
+			} else {
+				// 批次数为 0：可能上游把奖励并入周期额度、或改了发放标记口径。
+				// 如实说「未观测到新增发放」，不编一个 0。
+				log.Printf("checkin %s: 签到成功（本次未观测到新增发放；余额 %d/%d）",
+					logfmt.Label(st.UID, st.Nickname), grants.Remain, grants.Total)
+			}
+		}
+		s.cfg.Pool.ReenableIfCredits(st.UID, grants.Remain, grants.Total)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, grants.Remain, grants.Total, grants.Expiring, grants.EarliestAt, grants.EarliestRemaining)
 	}
 	s.RunStreakBonusNow()
 }
