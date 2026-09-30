@@ -46,27 +46,23 @@ jobs:
         with:
           fetch-depth: 0   # 版本号解析要看 tag 历史
 
-      # dkorpel/setup-nsis 这个小 action 用的 node16 在 windows-latest 上已废弃，
-      # 会触发自动迁移、输出噪音且未来可能直接失败。NSIS 在 runner 镜像里本来就有，
-      # 找不到才用 choco 兜底（免掉第三方 action 的运行时风险）。
-      - name: 确保有 makensis
+      # NSIS 的取用策略（踩过两个坑）：
+      #   1. choco install 之后同一 step 里调 `makensis` 会失败：GITHUB_PATH 的改动
+      #      只对**后续** step 生效。所以安装与调用必须分成两步。
+      #   2. 不能假设 runner 镜像里 preinstall 了就一定有 —— windows-latest 上没有，
+      #      必须走 choco。
+      # 不依赖第三方 action（dkorpel/setup-nsis 仍在 node16 运行时，已被强制迁移）。
+      - name: 安装 NSIS
         shell: pwsh
         run: |
-          $mk = Get-Command makensis -ErrorAction SilentlyContinue
-          if (-not $mk) {
-            $cand = @(
-              "$env:ProgramFiles(x86)\NSIS\makensis.exe",
-              "$env:ProgramFiles\NSIS\makensis.exe"
-            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if ($cand) {
-              $dir = Split-Path $cand
-              echo $dir >> $env:GITHUB_PATH
-            } else {
-              choco install nsis -y --no-progress
-              echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
-            }
-          }
-          makensis /VERSION
+          choco install nsis -y --no-progress
+          $mk = Get-ChildItem "C:\Program Files (x86)\NSIS\makensis.exe","C:\Program Files\NSIS\makensis.exe" `
+                -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $mk) { Write-Host "::error::装完仍找不到 makensis"; exit 1 }
+          Write-Host "makensis = $($mk.FullName)"
+          # 写进 GITHUB_PATH，供后续 step 使用（本 step 内用绝对路径验证）
+          Split-Path $mk.FullName >> $env:GITHUB_PATH
+          & $mk.FullName /VERSION
 
       - uses: actions/setup-go@v5
         with:
@@ -77,8 +73,15 @@ jobs:
       # genWindowsResources 里，由下面的 go run ./scripts/package 间接调用
       # （package.go → go run ./scripts/build.go → 先生成 .syso 再 go build）。
       # 所以这里只需保证 go-winres 在 PATH 上，不要再写一步 go generate。
+      # 当场用绝对路径验证一次，别等到打包时才因为「命令找不到」失败。
       - name: 装 go-winres（生成 exe 图标/版本资源）
-        run: go install github.com/tc-hib/go-winres@latest
+        shell: pwsh
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          $bin = Join-Path (go env GOPATH) "bin"
+          Write-Host "gopath/bin = $bin"
+          $bin >> $env:GITHUB_PATH
+          & (Join-Path $bin "go-winres.exe") version
 
       - name: 构建 + 打包
         working-directory: desktop

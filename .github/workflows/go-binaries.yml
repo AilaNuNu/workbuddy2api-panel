@@ -62,7 +62,7 @@ jobs:
           # 曾经从 cmd/server/main.go 取，重构后 main.go 变成 41 行薄壳、常量迁到 appcore，
           # 旧提取式会 grep 到空值 → 文件名退化成 "wb2api-panel-v-windows-amd64.zip"。
           # 这里在提取处直接断言，避免静默产出坏文件名。
-          SRC=$(grep -oP '^\s*AppVersion\s*=\s*"\K[^"]+' internal/appcore/runtime.go | head -1)
+          SRC=$(grep -oP '^\s*const\s+AppVersion\s*=\s*"\K[^"]+' internal/appcore/runtime.go | head -1)
           if [[ -z "$SRC" ]]; then
             echo "::error::未从 internal/appcore/runtime.go 提取到 AppVersion"
             exit 1
@@ -121,7 +121,7 @@ jobs:
           fetch-depth: 0   # 取历史 tag 算 compare 链接
       - name: tag 与源码版本一致性断言
         run: |
-          SRC=$(grep -oP '^\s*AppVersion\s*=\s*"\K[^"]+' internal/appcore/runtime.go | head -1)
+          SRC=$(grep -oP '^\s*const\s+AppVersion\s*=\s*"\K[^"]+' internal/appcore/runtime.go | head -1)
           if [[ -z "$SRC" ]]; then
             echo "::error::未从 internal/appcore/runtime.go 提取到 AppVersion"
             exit 1
