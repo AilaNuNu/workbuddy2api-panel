@@ -68,20 +68,22 @@ jobs:
         with:
           go-version-file: desktop/go.mod   # 桌面版要 go >= 1.25
 
-      # go-winres 生成 exe 的图标与版本资源（.syso）。它不进版本库，必须在构建机上现装。
+      # 装 go-winres（生成 exe 图标/版本资源）。它不进版本库，必须在构建机上现装。
       # 注意：**没有** go:generate 指令 —— 生成动作在 scripts/build.go 的
       # genWindowsResources 里，由下面的 go run ./scripts/package 间接调用
       # （package.go → go run ./scripts/build.go → 先生成 .syso 再 go build）。
       # 所以这里只需保证 go-winres 在 PATH 上，不要再写一步 go generate。
-      # 当场用绝对路径验证一次，别等到打包时才因为「命令找不到」失败。
-      - name: 装 go-winres（生成 exe 图标/版本资源）
+      # 当场自验一次，别等到打包时才因为「命令找不到」失败。
+      # 用 --help 而不是 `version`：go-winres 没有 version 子命令（会报
+      # "No help topic for 'version'"），踩过。
+      - name: 装 go-winres
         shell: pwsh
         run: |
           go install github.com/tc-hib/go-winres@latest
           $bin = Join-Path (go env GOPATH) "bin"
           Write-Host "gopath/bin = $bin"
           $bin >> $env:GITHUB_PATH
-          & (Join-Path $bin "go-winres.exe") version
+          & (Join-Path $bin "go-winres.exe") --help | Select-Object -First 3
 
       - name: 构建 + 打包
         working-directory: desktop
@@ -122,20 +124,27 @@ jobs:
           if ($fail) { exit 1 }
 
       # 二进制里嵌的修订号必须等于本次构建的提交（否则发布物对不上源码）。
-      # 注意：CI 里工作树是干净的，所以不会有 +dirty。
+      # 用 vcs.revision（完整 sha）而不是 mod 行的伪版本号：后者还要解析
+      # v0.0.0-<时间>-<sha> 格式；vcs.modified 还能直接暴露「构建时工作树是脏的」——
+      # CI 里 checkout 出来必然是干净的，一旦是 true 就说明构建的不是这份源码。
       - name: 断言内嵌修订号
         working-directory: desktop
         shell: pwsh
         run: |
-          $meta = go version -m .\wb2api-desktop.exe | Select-String '^\s+mod\s'
-          $meta = $meta.Line.Trim()
-          $sha = "${{ github.sha }}"
-          Write-Host "内嵌: $meta"
-          Write-Host "提交: $sha"
-          if ($meta -notmatch [regex]::Escape($sha.Substring(0,12))) {
-            Write-Host "::error::exe 内嵌修订号与本次提交不一致 —— 构建的是别的树"
+          $info = go version -m .\wb2api-desktop.exe
+          $rev = ($info | Select-String 'vcs\.revision=').Line
+          $mod = ($info | Select-String 'vcs\.modified=').Line
+          Write-Host "内嵌: $rev / $mod"
+          Write-Host "提交: ${{ github.sha }}"
+          if ($rev -notmatch [regex]::Escape("${{ github.sha }}")) {
+            Write-Host "::error::exe 内嵌修订号与本次提交不一致 —— 构建的不是这份源码"
             exit 1
           }
+          if ($mod -match 'vcs\.modified=true') {
+            Write-Host "::error::exe 标记为脏树构建（+dirty），发布产物不应如此"
+            exit 1
+          }
+          Write-Host "修订号断言通过"
 
       - uses: actions/upload-artifact@v4
         with:
