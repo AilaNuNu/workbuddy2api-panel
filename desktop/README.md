@@ -128,6 +128,9 @@ powershell "(Get-Item 'D:\WorkBuddy2API\wb2api-desktop.exe').VersionInfo | Forma
 用户数据固定在 `%APPDATA%\WorkBuddy2API`（或 `WB2A_DATA_DIR`），与装在哪无关。
 所以把数据目录整体搬走、或在别的机器上恢复，都不需要重装。
 
+实测（v1.11.6 → v1.11.10 覆盖安装）：`config.json` 与 3 个 `auths/*.json` 逐字节
+不变，`api_key` 指纹不变，安装目录仍是原来的 `D:\WorkBuddy2API`。
+
 一个容易踩的坑：便携版通过 `Run-Portable.cmd` 设 `WB2A_DATA_DIR=%~dp0data` 指向自己
 的文件夹，但**直接双击便携版目录里的 exe 不会经过它** —— 那会去找
 `%APPDATA%\WorkBuddy2API`，也就是安装版的数据。
