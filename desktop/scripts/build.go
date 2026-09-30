@@ -160,7 +160,19 @@ func genWindowsResources(desktopDir, ver string) {
 	}
 
 	// 输出必须恰好是 <包名>.syso：Go 只会自动包含以 .syso 结尾且不带 GOOS/GOARCH 后缀的文件。
-	// go-winres 的 --out 是「前缀」，给了名字后它仍可能写出无扩展名的文件，故生成后改名。
+	//
+	// go-winres 的 --out 是「前缀」，它的**落盘文件名取决于目标是否已存在**（实测）：
+	//   - <前缀>.syso 不存在 → 写 <前缀>.syso
+	//   - <前缀>.syso 已存在 → 改写**无扩展名**的 <前缀>
+	// 这个差异很坑：旧代码只在「.syso 不存在」时才改名，于是第二次构建起
+	//   ① 每构建一次多一个无扩展名垃圾文件；
+	//   ② 新资源（版本号/图标）被写进那个文件，而 Go 读的是**没被更新**的 .syso
+	//      → exe 永远带着上一次、甚至上上次的版本号与图标，且不报任何错。
+	// 正因为这个表现只在「已构建过一次」的树上出现，干净 checkout 的 CI 从来不会
+	// 复现，本地开发却每次都踩。
+	//
+	// 所以：把无扩展名文件当成**主产物**接收，始终用它覆盖 .syso 并清掉它自己。
+	// 不能只看 .syso 是否存在——那正是旧逻辑失败的地方。
 	outPrefix := filepath.Join(desktopDir, "wb2api-desktop")
 	fmt.Println("→ 生成 Windows 资源（exe 图标 + 版本信息）…")
 	cmd := exec.Command(tool, "simply",
@@ -181,15 +193,15 @@ func genWindowsResources(desktopDir, ver string) {
 	}
 
 	syso := outPrefix + ".syso"
-	if _, err := os.Stat(syso); err != nil {
-		// go-winres 可能写成无扩展名的 outPrefix，补一次改名。
-		if _, e2 := os.Stat(outPrefix); e2 == nil {
-			if rerr := os.Rename(outPrefix, syso); rerr != nil {
-				fail(fmt.Errorf("go-winres 产物改名失败: %w", rerr))
-			}
-		} else {
-			fail(fmt.Errorf("go-winres 未生成 %s: %w", filepath.Base(syso), err))
+	// 两种落盘形态都收：无扩展名（增量构建）与 .syso（首次构建）。
+	// 无扩展名那份若存在，就是本次刚生成的最新资源，用它覆盖 .syso。
+	if _, err := os.Stat(outPrefix); err == nil {
+		if rerr := os.Rename(outPrefix, syso); rerr != nil {
+			fail(fmt.Errorf("go-winres 产物改名失败: %w", rerr))
 		}
+	}
+	if _, err := os.Stat(syso); err != nil {
+		fail(fmt.Errorf("go-winres 未产出 %s: %w", filepath.Base(syso), err))
 	}
 	fmt.Printf("   %s 已生成（图标 %s，版本 %s）\n", filepath.Base(syso), filepath.Base(icon), ver)
 }
