@@ -41,6 +41,31 @@ go run ./scripts/package -no-zip         # 只出安装包，不出便携版 zip
 | `wb2api-desktop-<版本>-setup.exe` | NSIS 安装包，约 5.3 MiB |
 | `wb2api-desktop-<版本>-portable.zip` | 免安装版，约 7.4 MiB |
 
+## 发布
+
+桌面版有独立的 tag 版本线：**`desktop-v<版本>`**，与上游服务端/CLI 的 `v<版本>`
+分开。
+
+为什么必须分开：`.github/workflows/go-binaries.yml` 监听 `tags: ["v*"]`，并带一条
+「tag 版本 == 源码 AppVersion」的断言。桌面版走自己的版本号规则，若也用 `v*`
+前缀，会互相触发、并且把桌面版 tag 丢进那条与它无关的断言里。`desktop-v*` 不匹配
+`v*`，两条发布线彻底隔离。
+
+```bash
+# 打 tag 并推送即触发发布（.github/workflows/desktop-release.yml）
+git tag -a desktop-v1.11.10 -m "桌面版 1.11.10"
+git push <remote> desktop-v1.11.10
+```
+
+工作流在 `windows-latest` 上：装 NSIS → 装 go-winres → `go run ./scripts/package`
+→ 自检（产物存在/大小/zip 无敏感条目/exe 内嵌修订号 == 本次提交）→ 建 Release
+（两个产物 + `checksums.txt`）。也可以 `workflow_dispatch` 手动跑。
+
+**tag 名会被规范化之后再当版本号用**：解析器剥掉 `desktop-` 与 `v` 前缀、并校验
+余下部分是纯数字段（`desktop-v1.11.10` → `1.11.10`）。这样 `git describe` 无论
+命中哪条版本线的 tag，出来的都是可用的版本串；抽不出合法版本号时报错降级，
+不会把 `desktop-v1.11.10` 这种串塞进 NSIS 的 `VIProductVersion`（那会被直接拒绝）。
+
 **发布前请从干净的已提交状态构建。** Go 会把当前 commit 与工作树是否脏嵌进二进制
 （`go version -m` 可见 `...+dirty`），脏树构建出来的产物带 `+dirty` 戳、对不上任何
 提交号。代码本身是确定性的：同一状态下连续构建，产物逐字节一致。
@@ -55,7 +80,7 @@ go run ./scripts/package -no-zip         # 只出安装包，不出便携版 zip
 > 脚本共用一份实现。
 
 需要 NSIS（`winget install NSIS.NSIS`）。脚本按 `PATH` → `C:\Program Files (x86)\NSIS`
-→ `D:\Tools\nsis` 的顺序自动查找 `makensis`，找不到会给出装法。
+→ `C:\nsis` 的顺序自动查找 `makensis`，找不到会给出装法。
 
 安装包行为：
 
@@ -106,22 +131,24 @@ go run ./scripts/package -no-zip         # 只出安装包，不出便携版 zip
 至少核对这几项：
 
 ```cmd
-:: 1) 数据完好：账号数、api_key 指纹、逐文件哈希
-python D:\Tools\uitest\verify_after_install.py
+:: 1) 数据目录里有什么（配置 + 每个账号一个凭证文件）
+dir /b "%APPDATA%\WorkBuddy2API"
+dir /b "%APPDATA%\WorkBuddy2API\auths"
 
-:: 2) 装的是新 exe：与构建产物的 sha256 一致
-certutil -hashfile "D:\WorkBuddy2API\wb2api-desktop.exe" SHA256
+:: 2) 装的是新 exe：与下载页 checksums.txt 里的 sha256 比
+certutil -hashfile "%LOCALAPPDATA%\Programs\WorkBuddy2API\wb2api-desktop.exe" SHA256
 
 :: 3) PE 版本资源（右键属性 → 详细信息，或）
-powershell "(Get-Item 'D:\WorkBuddy2API\wb2api-desktop.exe').VersionInfo | Format-List"
+powershell "(Get-Item 'C:\path\to\wb2api-desktop.exe').VersionInfo | Format-List"
 ```
 
 不打印密钥值。`auths/*.json` 与 `config.json` 的内容一致才叫没问题；
 `state.json` / `usage.json` / 日志**本来就会变**（运行时持续写入），不算异常。
 **`api_key` 一旦被换，所有已用旧密钥配置的客户端会立刻全部 401**，这是最需要盯的一项。
 
-> `verify_after_install.py` 属于开发机上的临时工具（在 `D:\Tools\uitest\`，不在仓库里）。
-> 没有它也能手工核对：比 `config.json` 与 `auths/` 的文件时间戳和账号数量即可。
+> 判断 `api_key` 有没有被换：不要看文件内容（那会打印密钥），只比指纹 ——
+> 例如 PowerShell 里 `(Get-FileHash '%APPDATA%\WorkBuddy2API\config.json').Hash`，
+> 或者拿面板「配置」页显示的那串前缀对一下。指纹没变就是没被换。
 
 ### 数据目录不跟着安装目录走
 
@@ -129,7 +156,7 @@ powershell "(Get-Item 'D:\WorkBuddy2API\wb2api-desktop.exe').VersionInfo | Forma
 所以把数据目录整体搬走、或在别的机器上恢复，都不需要重装。
 
 实测（v1.11.6 → v1.11.10 覆盖安装）：`config.json` 与 3 个 `auths/*.json` 逐字节
-不变，`api_key` 指纹不变，安装目录仍是原来的 `D:\WorkBuddy2API`。
+不变，`api_key` 指纹不变，安装目录沿用原来的（读注册表 `InstallDir`，不会装出第二份）。
 
 一个容易踩的坑：便携版通过 `Run-Portable.cmd` 设 `WB2A_DATA_DIR=%~dp0data` 指向自己
 的文件夹，但**直接双击便携版目录里的 exe 不会经过它** —— 那会去找

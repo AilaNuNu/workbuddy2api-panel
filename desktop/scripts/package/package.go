@@ -250,8 +250,8 @@ func findMakensis(explicit string) (string, error) {
 	candidates := []string{
 		`C:\Program Files (x86)\NSIS\makensis.exe`,
 		`C:\Program Files\NSIS\makensis.exe`,
-		`D:\Tools\nsis\makensis.exe`,
-		`D:\Tools\nsis\NSIS\makensis.exe`,
+		`C:\nsis\makensis.exe`,
+		`C:\nsis\NSIS\makensis.exe`,
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
@@ -260,7 +260,7 @@ func findMakensis(explicit string) (string, error) {
 	}
 	return "", fmt.Errorf(`找不到 makensis。
   装 NSIS：winget install NSIS.NSIS
-  或下载 zip 解压到 D:\Tools\nsis（脚本会自动找到），
+  或下载 zip 解压到 C:\nsis（脚本会自动找到），
   或显式指定：go run ./scripts/package.go -makensis <路径>`)
 }
 

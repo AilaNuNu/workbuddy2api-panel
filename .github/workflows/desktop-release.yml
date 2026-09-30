@@ -1,0 +1,192 @@
+name: desktop-release
+
+# 桌面版（Wails v3 + WebView2）Windows 产物构建与发布。
+#
+#   - push main / PR      → 编译 + 冒烟（只验证能不能构建，不发包）
+#   - push desktop-v* tag → 构建 exe → NSIS 安装包 + 免安装 zip → 建 Release
+#   - workflow_dispatch   → 手动跑（可指定 tag 名只做构建产物上传为 artifact）
+#
+# 与 go-binaries.yml 的分工：那个管服务端/CLI 的五平台二进制，这个只管桌面壳。
+# 两者互不依赖 —— 桌面版是独立 Go 模块（desktop/go.mod），根模块构建看不到它。
+#
+# 为什么 tag 前缀是 desktop-v 而不是 v：
+#   上游的 go-binaries.yml 监听 tags: ["v*"]，且带「tag 版本 == 源码 AppVersion」断言。
+#   桌面版有自己的版本线（desktop/scripts/internal/version 解析 AppVersion → tag），
+#   两套版本号用同一前缀会互相触发、并触发一个与它们无关的一致性断言。
+#   desktop-v* 不匹配 v*，两边彻底隔离。
+
+on:
+  push:
+    branches: [main]
+    tags: ["desktop-v*"]
+  pull_request:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-release.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 desktop-v1.11.10，留空则只构建不发布）"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # 构建两个产物，并做「产物自检」——打包脚本会往 stdout 打机器可读的 WB2A_RELEASE 行
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 版本号解析要看 tag 历史
+
+      # dkorpel/setup-nsis 这个小 action 用的 node16 在 windows-latest 上已废弃，
+      # 会触发自动迁移、输出噪音且未来可能直接失败。NSIS 在 runner 镜像里本来就有，
+      # 找不到才用 choco 兜底（免掉第三方 action 的运行时风险）。
+      - name: 确保有 makensis
+        shell: pwsh
+        run: |
+          $mk = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $mk) {
+            $cand = @(
+              "$env:ProgramFiles(x86)\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($cand) {
+              $dir = Split-Path $cand
+              echo $dir >> $env:GITHUB_PATH
+            } else {
+              choco install nsis -y --no-progress
+              echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
+            }
+          }
+          makensis /VERSION
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop/go.mod   # 桌面版要 go >= 1.25
+
+      # go-winres 生成 exe 的图标与版本资源（.syso）。它不进版本库，必须在构建机上现装。
+      # 注意：**没有** go:generate 指令 —— 生成动作在 scripts/build.go 的
+      # genWindowsResources 里，由下面的 go run ./scripts/package 间接调用
+      # （package.go → go run ./scripts/build.go → 先生成 .syso 再 go build）。
+      # 所以这里只需保证 go-winres 在 PATH 上，不要再写一步 go generate。
+      - name: 装 go-winres（生成 exe 图标/版本资源）
+        run: go install github.com/tc-hib/go-winres@latest
+
+      - name: 构建 + 打包
+        working-directory: desktop
+        run: go run ./scripts/package
+
+      # 产物自检。脚本会把 size 和 sha256 打出来，这里独立复算一遍，
+      # 防止「脚本说成功但文件是空的/被截断」这类静默失败。
+      - name: 校验产物
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          $ver = (Select-String -Path ..\internal\appcore\runtime.go `
+                  -Pattern 'AppVersion\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $ver = $ver -replace '-panel$',''
+          $setup = Join-Path $dist "wb2api-desktop-$ver-setup.exe"
+          $zip   = Join-Path $dist "wb2api-desktop-$ver-portable.zip"
+          $fail = $false
+          foreach ($f in @($setup, $zip)) {
+            if (-not (Test-Path $f)) { Write-Host "::error::缺少产物 $f"; $fail = $true; continue }
+            $len = (Get-Item $f).Length
+            if ($len -lt 100000) { Write-Host "::error::$f 过小（$len B）"; $fail = $true; continue }
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            Write-Host "OK $f  $len B  sha256=$h"
+          }
+          # zip 绝不能含 data/ 或 config.json（里头是真实账号凭证）
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $names = $z.Entries | ForEach-Object { $_.FullName.ToLower() }
+            Write-Host "zip 内容: $($names -join ', ')"
+            foreach ($n in $names) {
+              if ($n -match 'data/|config\.json|auths|token|\.env|\.log$') {
+                Write-Host "::error::zip 含敏感条目 $n"; $fail = $true
+              }
+            }
+          } finally { $z.Dispose() }
+          if ($fail) { exit 1 }
+
+      # 二进制里嵌的修订号必须等于本次构建的提交（否则发布物对不上源码）。
+      # 注意：CI 里工作树是干净的，所以不会有 +dirty。
+      - name: 断言内嵌修订号
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $meta = go version -m .\wb2api-desktop.exe | Select-String '^\s+mod\s'
+          $meta = $meta.Line.Trim()
+          $sha = "${{ github.sha }}"
+          Write-Host "内嵌: $meta"
+          Write-Host "提交: $sha"
+          if ($meta -notmatch [regex]::Escape($sha.Substring(0,12))) {
+            Write-Host "::error::exe 内嵌修订号与本次提交不一致 —— 构建的是别的树"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.zip
+          retention-days: 7
+
+  # 仅 tag（或手动指定 tag）触发发布。
+  # 注意 if 里显式判断 event_name：inputs 上下文只在 workflow_dispatch/workflow_call
+  # 下存在，直接从 tag push 事件里读 inputs.tag 取值有歧义，容易踩「本该发布却没发布」。
+  release:
+    needs: build
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/desktop-v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-windows
+          path: dist
+
+      - name: 列出待发布产物
+        run: ls -la dist/
+
+      - name: checksums
+        run: cd dist && sha256sum * > checksums.txt && cat checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            桌面版 Windows 产物（CI 自动构建）。
+
+            | 文件 | 适用 |
+            |---|---|
+            | `*-setup.exe` | 安装版：按用户安装到 `%LOCALAPPDATA%\Programs\WorkBuddy2API`，不弹 UAC |
+            | `*-portable.zip` | 免安装版：解压即用，数据存在自己文件夹里，删掉即无残留 |
+
+            用户数据固定放在 `%APPDATA%\WorkBuddy2API`（便携版为解压目录下 `data\`），
+            **覆盖安装不会动它**。首次运行自动生成 `config.json` 与随机 `api_key` 并弹窗告知。
+
+            产物不含任何 `data/` 或 `config.json`。
+
+            校验下载：`sha256sum -c checksums.txt`
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/checksums.txt

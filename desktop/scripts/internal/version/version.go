@@ -51,10 +51,20 @@ func Source(desktopDir string) (string, error) {
 	return v, nil
 }
 
-// GitTag 取最近的 git tag 并去掉 v 前缀（v1.11.9 → 1.11.9），Source 失败时的备选。
+// verRe 从 tag 里抽取版本号本体。抽不出来就报错，不猜。
+var verRe = regexp.MustCompile(`^\d+(?:\.\d+){1,3}$`)
+
+// GitTag 取最近的 git tag 并抽出版本号，Source 失败时的备选。
 //
 // dir 显式传给 git 子进程：不传的话取的是本进程的 CWD，脚本从别处调起时会静默
 // 落到错误的仓库上。
+//
+// 为什么要这么啰嗦地剥前缀：仓库里同时存在两套 tag —— 上游的 `v1.11.9`（服务端/CLI
+// 版本线）和桌面版的 `desktop-v1.11.10`。`git describe --tags` 对两者一视同仁，
+// 谁近取谁，所以它可能返回形如 `desktop-v1.11.10` 的串。天真的 `TrimPrefix("v")`
+// 只对前者有效，遇到后者会得到 `desktop-v1.11.10` —— 这个值送进 NSIS 的
+// `VIProductVersion` 会被直接拒绝（它要求 4 段纯数字），错误还很难反查。
+// 这里改用「剥掉已知前缀 + 正则校验」：对不上就报错，由 Resolve 决定降级。
 func GitTag(dir string) (string, error) {
 	cmd := exec.Command("git", "describe", "--tags", "--abbrev=0")
 	cmd.Dir = dir
@@ -62,9 +72,27 @@ func GitTag(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	v := strings.TrimPrefix(strings.TrimSpace(string(out)), "v")
-	if v == "" {
+	return parseTag(string(out))
+}
+
+// parseTag 把 tag 名规范化为纯版本号（v1.11.9 → 1.11.9，
+// desktop-v1.11.10 → 1.11.10，v1.11.10-desktop → 1.11.10）。
+func parseTag(tag string) (string, error) {
+	raw := strings.TrimSpace(tag)
+	if raw == "" {
 		return "", fmt.Errorf("git tag 为空")
+	}
+	// 先剥「desktop-v」再剥「v」：前者以 d 开头，顺序反了也剥不掉，但明确写两次
+	// 比依赖单一 TrimPrefix 更能表达「两种前缀都存在」这个事实。
+	v := strings.TrimPrefix(raw, "desktop-")
+	v = strings.TrimPrefix(v, "v")
+	// 后缀形态：v1.11.10-desktop → 只取前导版本号。
+	if i := strings.Index(v, "-"); i > 0 {
+		v = v[:i]
+	}
+	v = strings.TrimSpace(v)
+	if !verRe.MatchString(v) {
+		return "", fmt.Errorf("无法从 tag %q 解析出版本号（得到 %q）", raw, v)
 	}
 	return v, nil
 }

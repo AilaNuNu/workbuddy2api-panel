@@ -68,7 +68,16 @@ func main() {
 			name += ".exe"
 		}
 	}
-	outPath := filepath.Join(desktopDir, name)
+	// 相对路径按 desktop 模块根解析，而不是 CWD。
+	//
+	// 曾经直接 Join(desktopDir, name)：传 `-o rb1.exe` 时这个组合其实是对的，
+	// 但传 `-o tmp/rb1.exe` 之类的相对路径会相对于 desktopDir 再拼一层；而真正
+	// 的坑是「相对路径的语义随调用方 CWD 变」——package.go 从 desktop/ 调起时
+	// 与手工从别处调起时落到不同位置。统一以模块根为基准，行为不再依赖 CWD。
+	outPath := name
+	if !filepath.IsAbs(outPath) {
+		outPath = filepath.Join(desktopDir, outPath)
+	}
 
 	ldflags := "-s -w"
 	if runtime.GOOS == "windows" && !*debug {
