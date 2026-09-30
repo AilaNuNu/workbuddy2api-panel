@@ -174,13 +174,30 @@ jobs:
       - name: 列出待发布产物
         run: ls -la dist/
 
+      # tag 名单独解析成输出，不在 action 的 with 里直接写 `inputs.tag || github.ref_name`。
+      # 原因：inputs 上下文只在 workflow_dispatch/workflow_call 下存在，在 tag push
+      # 事件里引用它有歧义（可能取到空值），把「发到哪个 tag」这种关键参数交给
+      # 隐式回退不合适。
+      - name: 解析发布 tag
+        id: t
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "$TAG" ]; then echo "::error::解析不到 tag 名"; exit 1; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "发布 tag = $TAG"
+
       - name: checksums
         run: cd dist && sha256sum * > checksums.txt && cat checksums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ steps.t.outputs.tag }}
+          name: ${{ steps.t.outputs.tag }}
           draft: false
           prerelease: false
           generate_release_notes: true
