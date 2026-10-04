@@ -42,7 +42,7 @@ import (
 
 // AppVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // 桌面壳与命令行入口共用同一版本号，避免回答用户时出现两个版本。
-const AppVersion = "1.11.10-panel"
+const AppVersion = "1.11.11-panel"
 
 // EntryConfig 两个入口（cmd/server 与桌面壳）共用的启动参数。
 type EntryConfig struct {
