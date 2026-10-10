@@ -55,11 +55,17 @@ type Config struct {
 }
 
 // Event 是一条脱敏请求记录。Account 只保存“昵称(uid8)”标签，不保存完整 UID。
+//
+// KeyID / KeyName 记录这条请求由哪个密钥发起（管理密钥 = "admin" / "管理密钥"；
+// 客户端密钥 = 用户起的名字）。**只存归属标识与名字，绝不存密钥原文** —— 密钥值一旦
+// 落进日志文件，就等于把可用的凭据散布到了磁盘上（归档目录还会被面板读取与下载）。
 type Event struct {
 	Time             time.Time `json:"time"`
 	RequestID        string    `json:"request_id"`
 	Path             string    `json:"path"`
 	Account          string    `json:"account,omitempty"`
+	KeyID            string    `json:"key_id,omitempty"`
+	KeyName          string    `json:"key_name,omitempty"`
 	Model            string    `json:"model,omitempty"`
 	Status           int       `json:"status"`
 	OK               bool      `json:"ok"`
@@ -78,6 +84,7 @@ type Event struct {
 type Filter struct {
 	Outcome string
 	Account string
+	Key     string
 	Model   string
 }
 
@@ -566,6 +573,11 @@ func (f Filter) match(e Event) bool {
 		return false
 	}
 	if f.Account != "" && !strings.Contains(e.Account, f.Account) {
+		return false
+	}
+	// Key 同时匹配 id 与名字：面板的下拉给出的是名字，而按 id 筛（比如从用量页
+	// 跳过来）也要能用，两列都看一次省得前端记两套参数。
+	if f.Key != "" && !strings.Contains(e.KeyID, f.Key) && !strings.Contains(e.KeyName, f.Key) {
 		return false
 	}
 	if f.Model != "" && !strings.Contains(e.Model, f.Model) {

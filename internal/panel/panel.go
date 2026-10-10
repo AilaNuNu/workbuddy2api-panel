@@ -72,6 +72,15 @@ type Config struct {
 	// 明确交付给用户，否则用户会把自己锁在门外。
 	RotateAPIKey func() (string, error)
 
+	// ListClientKeys 列出全部客户端密钥（含已停用；Key 为原文，仅供管理密钥读取）。
+	ListClientKeys func() ([]ClientKeyView, error)
+	// CreateClientKey 新建一把客户端密钥（密钥由服务端生成），返回含原文的视图。
+	CreateClientKey func(name, note string) (ClientKeyView, error)
+	// SetClientKeyEnabled 启用/停用一把客户端密钥（落盘 + 热生效）。
+	SetClientKeyEnabled func(id string, enabled bool) error
+	// DeleteClientKey 删除一把客户端密钥（落盘 + 热生效；历史统计靠桶里冗余的名字仍可读）。
+	DeleteClientKey func(id string) error
+
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
@@ -217,6 +226,10 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("POST /panel/api/config/reroll_key", p.withAuth(p.rerollKey))
+	p.mux.HandleFunc("GET /panel/api/client_keys", p.withAuth(p.clientKeysList))
+	p.mux.HandleFunc("POST /panel/api/client_keys", p.withAuth(p.clientKeyCreate))
+	p.mux.HandleFunc("POST /panel/api/client_keys/enabled", p.withAuth(p.clientKeySetEnabled))
+	p.mux.HandleFunc("POST /panel/api/client_keys/remove", p.withAuth(p.clientKeyRemove))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -226,12 +239,27 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
-// 即用新值（无需重启）。
+// withAuth 面板鉴权：在全部凭据里挑，但**只接受管理凭据**。
+//
+// 与网关（/v1/*）的关键差异：网关接受全部凭据，面板只接受管理密钥。客户端密钥是发给
+// 其他设备的，只要能进面板，就等于把「看全部账号、改配置、重置密钥」的能力一起发了出去。
+// 判定依据是凭据自身的 Admin 标记 —— 用的仍是同一个凭据集合（快照里的 Creds），
+// 与网关同源，避免出现「网关认、面板不认」这类两套口径的漂移。
+//
+// 用 Admin 标记而不是「比较密钥字符串是否等于 APIKey」：后者要求面板额外持有并维护
+// 一份"管理密钥"的独立副本，那份副本一旦没跟上就会静默变成另一套判定逻辑。
+//
+// 提示信息刻意保持与"密钥完全无效"完全一致：若把"这是有效密钥但不是管理密钥"回给
+// 调用方，就等于送出一个密钥有效性判定接口，可以拿它逐个试探密钥是否合法。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		id, ok := httpauth.Authenticate(r, p.loadLive().Creds)
+		if !ok || !id.Admin {
+			if ok {
+				// 能过鉴权但不是管理密钥：通常不是攻击，而是把客户端密钥填进了面板的
+				// 密钥门。服务端日志点明这一条，免得排查时误以为是密钥写错了。
+				log.Printf("panel: 拒绝非管理密钥访问 %s（该密钥只能用于网关 /v1/*）", r.URL.Path)
+			}
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
@@ -239,12 +267,15 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// apiKey 当前生效密钥（Live 优先，回落静态字段）。
-func (p *Panel) apiKey() string {
+// loadLive 当前运行期快照（Live 优先，回落静态字段合成）。
+func (p *Panel) loadLive() livecfg.Snapshot {
 	if p.cfg.Live != nil {
-		return p.cfg.Live.Load().APIKey
+		return p.cfg.Live.Load()
 	}
-	return p.cfg.APIKey
+	return livecfg.Snapshot{
+		APIKey: p.cfg.APIKey,
+		Creds:  httpauth.AdminCred(p.cfg.APIKey),
+	}
 }
 
 // expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
@@ -269,7 +300,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
+		"auth_required":   p.loadLive().AuthRequired(),
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
 		"total":           total,
@@ -414,6 +445,9 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		Outcome: r.URL.Query().Get("outcome"),
 		Account: r.URL.Query().Get("account"),
 		Model:   r.URL.Query().Get("model"),
+		// Key 同时匹配密钥 id 与其名字（见 reqlog.Filter.match），
+		// 所以「只看某台设备的请求」既能按名字筛，也能按 id 筛。
+		Key: r.URL.Query().Get("key"),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

@@ -2,12 +2,14 @@ package appcore
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 )
 
@@ -32,6 +34,7 @@ func rotFixture(t *testing.T, body string) (*Runtime, string) {
 		// 与生产（runtime.go 的 livecfg.New）用同一组字段构造，避免 fixture 漏字段
 		// 导致「测试过了但线上仍会清空快照」——这里正是要验证的陷阱。
 		live: livecfg.New(livecfg.Snapshot{
+			Creds:                credentialsOf(cfg),
 			APIKey:               cfg.APIKey,
 			SoftCooldown:         cfg.SoftRateDur,
 			SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
@@ -170,5 +173,95 @@ func TestNewAPIKeyShape(t *testing.T) {
 	}
 	if strings.ContainsAny(k, "+/=") {
 		t.Errorf("应为 URL-safe 无填充 base64：%q", k)
+	}
+}
+
+// authProbe 用某个密钥对当前热快照鉴权，返回命中的身份与是否通过。
+// 走的是真实的鉴权入口（httpauth.Authenticate），而不是比较字符串。
+func authProbe(rt *Runtime, key string) (httpauth.Identity, bool) {
+	req := httptest.NewRequest("GET", "/probe", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	return httpauth.Authenticate(req, rt.LiveSnapshot().Creds)
+}
+
+// TestRotateAPIKeyInvalidatesOldAdminKey 轮换后旧管理密钥必须**立刻**失效。
+//
+// 这是最容易写错的一点：快照是整体替换的，只把 APIKey 字段改成新值、却保留原样的
+// Creds 列表，旧密钥就还留在凭据集合里继续有效 —— 而「重置密钥」的全部意义就是让
+// 它立刻失效。只测"新密钥能用"是抓不到这个 bug 的，必须同时断言旧密钥不能用。
+func TestRotateAPIKeyInvalidatesOldAdminKey(t *testing.T) {
+	rt, _ := rotFixture(t, `{
+		"api_key":"sk-old-key",
+		"client_keys":[{"id":"k_tv","name":"客厅电视","key":"sk-tv","enabled":true}]
+	}`)
+
+	if _, ok := authProbe(rt, "sk-old-key"); !ok {
+		t.Fatal("轮换前旧管理密钥应有效")
+	}
+	if _, ok := authProbe(rt, "sk-tv"); !ok {
+		t.Fatal("轮换前客户端密钥应有效")
+	}
+
+	newKey, err := rt.RotateAPIKey()
+	if err != nil {
+		t.Fatalf("RotateAPIKey: %v", err)
+	}
+
+	if _, ok := authProbe(rt, "sk-old-key"); ok {
+		t.Error("轮换后旧管理密钥**仍然有效** —— Creds 没有被重建（重量级安全缺陷）")
+	}
+	id, ok := authProbe(rt, newKey)
+	if !ok {
+		t.Error("轮换后新管理密钥应有效")
+	} else if !id.Admin || id.ID != httpauth.AdminID {
+		t.Errorf("新管理密钥应命中管理身份，得到 %+v", id)
+	}
+	// 客户端密钥不该被「重置管理密钥」连坐：那是两个独立的东西，
+	// 把它们一起失效会让所有下游设备同时掉线。
+	id, ok = authProbe(rt, "sk-tv")
+	if !ok {
+		t.Error("轮换管理密钥不应影响客户端密钥")
+	} else if id.ID != "k_tv" {
+		t.Errorf("客户端密钥的身份应保持，得到 %+v", id)
+	}
+}
+
+// TestRotateAPIKeyKeepsClientKeysFromDisk 轮换必须基于**磁盘上最新的**客户端密钥重建
+// 凭据，而不是启动时的基线。
+//
+// r.Config 是启动时的装配基线（面板保存不会更新它）。若用它重建，面板后来新增的
+// 客户端密钥会在一次「重置密钥」之后集体消失 —— 表现为"刚发的密钥过一会儿全失效了"，
+// 且不会有任何报错。
+func TestRotateAPIKeyKeepsClientKeysFromDisk(t *testing.T) {
+	rt, path := rotFixture(t, `{"api_key":"sk-old-key"}`)
+
+	// 模拟面板之后新增了一个客户端密钥（直接改盘，r.Config 保持启动时的样子）。
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["client_keys"] = []any{map[string]any{
+		"id": "k_new", "name": "后来加的", "key": "sk-later", "enabled": true,
+	}}
+	out, _ := json.MarshalIndent(m, "", "  ")
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.Config.ClientKeys) != 0 {
+		t.Fatalf("前提不成立：运行配置本不该知道盘上新加的密钥，实际 %+v", rt.Config.ClientKeys)
+	}
+
+	if _, err := rt.RotateAPIKey(); err != nil {
+		t.Fatalf("RotateAPIKey: %v", err)
+	}
+	id, ok := authProbe(rt, "sk-later")
+	if !ok {
+		t.Error("轮换后盘上新加的客户端密钥失效了 —— 凭据是从 r.Config 而不是磁盘重建的")
+	} else if id.ID != "k_new" {
+		t.Errorf("身份 = %+v, want k_new", id)
 	}
 }

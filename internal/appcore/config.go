@@ -3,6 +3,7 @@ package appcore
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
@@ -21,6 +23,13 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths（桌面模式：数据目录下的 auths）
 	StateFile string `json:"state_file"` // ./data/state.json（桌面模式：数据目录下的 data/state.json）
+
+	// ClientKeys 分发给下游设备的客户端密钥。空 = 只用管理密钥（即旧行为）。
+	//
+	// 与管理密钥 APIKey 的关键差异：客户端密钥只能访问网关的 /v1/* 与 /status，
+	// **永远进不了管理面板**（/panel/api/*）。这正是「把密钥发给别人用」能成立的前提 ——
+	// 否则分发出去的每一个密钥都等于管理后台的钥匙。
+	ClientKeys []ClientKey `json:"client_keys"`
 
 	// Desktop 桌面应用模式：路径相对数据目录解析为绝对路径，见 config_desktop.go。
 	// 缺省 false = 服务端部署语义（相对 CWD），老配置与 Docker 部署零影响。
@@ -316,6 +325,154 @@ func ParseConfig(raw []byte) (*Config, error) {
 	return ParseConfigInto(raw, Default())
 }
 
+// ClientKey 一个分发给下游设备的客户端密钥。
+//
+// 为什么要有「名字」：分发出去之后，「哪台设备用了多少、出问题的是哪台」是唯一的
+// 运维问题。名字会随请求日志与用量统计一起落盘，是这些数据里唯一的可读区分依据，
+// 因此 normalize 要求它非空且不重名。
+type ClientKey struct {
+	// ID 归属标识。会写进用量桶与请求日志；密钥将来若轮换（换 Key 留 ID），
+	// 历史统计仍然连得上。留空时由 EffectiveID 按键原文派生。
+	ID string `json:"id"`
+	// Name 给人看的名字（"客厅电视"）。日志与统计的展示都靠它。
+	Name string `json:"name"`
+	// Key 密钥原文（sk- 前缀）。与 Config.APIKey 一样是**明文存储**——
+	// 面板需要能随时把密钥显示出来交付给设备，存摘要就再也拿不回来了。
+	// 因此 config.json 的权限（0600）就是这些密钥的保护边界。
+	Key string `json:"key"`
+	// Enabled 是否启用。**缺省 false**，即手写配置漏了这个字段时密钥不可用 ——
+	// 用 Enabled 而不是 Disabled，就是为了让「忘了写」朝安全的方向失败。
+	Enabled bool `json:"enabled"`
+	// CreatedAt 创建时刻（RFC3339），仅用于展示，不参与任何判定。
+	CreatedAt string `json:"created_at,omitempty"`
+	// Note 备注（"给我爸那台平板"）。仅展示。
+	Note string `json:"note,omitempty"`
+}
+
+// EffectiveID 归属标识：显式 ID 优先；为空时按键原文**确定性**派生。
+//
+// 为什么派生而不是「发现为空就生成一个补上」：normalize 每次 Load 都会跑，若为空就
+// 随机补，手写配置的每次加载都会换一个 id，用量统计会被切成互相孤立的一堆碎片。
+// 派生值只依赖密钥原文，跨进程、跨重启都稳定。
+func (k ClientKey) EffectiveID() string {
+	if id := strings.TrimSpace(k.ID); id != "" {
+		return id
+	}
+	sum := sha256.Sum256([]byte(k.Key))
+	return "k_" + fmt.Sprintf("%x", sum[:4])
+}
+
+// NewClientKeyID 生成密钥的归属标识（k_ + 8 字节随机 → hex）。
+func NewClientKeyID() string {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		// 极罕见。退化用时间戳，仍保证唯一性量级；绝不返回空 id ——
+		// 空 id 会让一批密钥在统计里混成同一个。
+		return fmt.Sprintf("k_t%x", time.Now().UnixNano())
+	}
+	return "k_" + fmt.Sprintf("%x", raw)
+}
+
+// NewClientKey 生成一个客户端密钥。Enabled 置 true：面板里点「创建」就是要能用，
+// 停用是一个后续的显式动作（而不是创建后的默认状态）。
+func NewClientKey(name, note string) (ClientKey, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ClientKey{}, fmt.Errorf("密钥名字不能为空")
+	}
+	key, err := NewAPIKey()
+	if err != nil {
+		return ClientKey{}, err
+	}
+	return ClientKey{
+		ID:        NewClientKeyID(),
+		Name:      name,
+		Key:       key,
+		Enabled:   true,
+		CreatedAt: time.Now().Format(time.RFC3339),
+		Note:      strings.TrimSpace(note),
+	}, nil
+}
+
+// normalizeClientKeys 校验客户端密钥，并就地整理（去空白）。
+//
+// 每条规则都对应一个具体的坑，宁可启动时报错也不静默放过：
+//   - 名字必须非空且不重名 —— 名字是日志与统计里唯一的区分依据，重名等于归属不可辨；
+//   - 密钥必须非空且互不相同 —— 同一个密钥出现两次一定是复制粘贴事故；
+//   - 密钥不得等于 api_key —— 那样这个「客户端密钥」实际也能进管理面板，
+//     分发出去等于泄露管理权（用户以为自己发的是只读密钥）；
+//   - id 不得重复 —— 否则两个设备的统计会并成一个；
+//   - 有客户端密钥时 api_key 不能为空 —— api_key 为空 = 管理面板完全不鉴权，
+//     此时「分级密钥」是自欺欺人。
+func (c *Config) normalizeClientKeys() error {
+	if len(c.ClientKeys) == 0 {
+		return nil
+	}
+	if c.APIKey == "" {
+		return fmt.Errorf("client_keys 已配置，但 api_key 为空；api_key 为空 = 管理面板完全不鉴权，" +
+			"此时分级密钥没有意义。请先设置 api_key")
+	}
+	seenKey := make(map[string]int, len(c.ClientKeys))
+	seenID := make(map[string]int, len(c.ClientKeys))
+	seenName := make(map[string]int, len(c.ClientKeys))
+	for i := range c.ClientKeys {
+		k := &c.ClientKeys[i]
+		k.Name = strings.TrimSpace(k.Name)
+		k.Key = strings.TrimSpace(k.Key)
+		k.Note = strings.TrimSpace(k.Note)
+		k.CreatedAt = strings.TrimSpace(k.CreatedAt)
+		k.ID = strings.TrimSpace(k.ID)
+
+		if k.Name == "" {
+			return fmt.Errorf("client_keys[%d]: 名字不能为空（日志与统计靠它区分设备）", i)
+		}
+		if k.Key == "" {
+			return fmt.Errorf("client_keys[%d] (%s): 密钥不能为空", i, k.Name)
+		}
+		if k.Key == c.APIKey {
+			return fmt.Errorf("client_keys[%d] (%s): 密钥与 api_key 相同 —— "+
+				"这个「客户端密钥」实际也能进管理面板，分发它等于泄露管理权", i, k.Name)
+		}
+		if prev, dup := seenKey[k.Key]; dup {
+			return fmt.Errorf("client_keys[%d] (%s): 密钥与 client_keys[%d] 相同", i, k.Name, prev)
+		}
+		id := k.EffectiveID()
+		if id == httpauth.AdminID {
+			return fmt.Errorf("client_keys[%d] (%s): id 不能是 %q —— 那是管理密钥的保留标识，"+
+				"撞名会让管理密钥的用量与这台设备并成一行", i, k.Name, httpauth.AdminID)
+		}
+		if prev, dup := seenID[id]; dup {
+			return fmt.Errorf("client_keys[%d] (%s): id %q 与 client_keys[%d] 重复", i, k.Name, id, prev)
+		}
+		if prev, dup := seenName[k.Name]; dup {
+			return fmt.Errorf("client_keys[%d]: 名字 %q 与 client_keys[%d] 重名 —— "+
+				"名字是区分设备的唯一依据，重名会让归属无法辨认", i, k.Name, prev)
+		}
+		seenKey[k.Key] = i
+		seenID[id] = i
+		seenName[k.Name] = i
+	}
+	return nil
+}
+
+// credentialsOf 构造鉴权凭据集合：管理密钥在前，随后是**已启用**的客户端密钥。
+//
+// 这是「哪些密钥能过」的唯一来源，网关与面板都从这里取。过滤（Enabled / 空密钥）
+// 只在这一处做，避免两边各写一遍而漂移 —— 比如一边忘了看 Enabled，被停用的密钥
+// 就仍能从那条路径进来。
+func credentialsOf(c *Config) []httpauth.Credential {
+	creds := httpauth.AdminCred(c.APIKey)
+	for _, k := range c.ClientKeys {
+		if !k.Enabled || k.Key == "" {
+			continue
+		}
+		creds = append(creds, httpauth.Credential{
+			ID: k.EffectiveID(), Name: k.Name, Key: k.Key, Admin: false,
+		})
+	}
+	return creds
+}
+
 // NewAPIKey 生成一个随机 API 密钥（18 字节 crypto/rand → base64url → "sk-" 前缀）。
 //
 // 抽成独立函数是为了让「重置密钥」与首启生成走同一条路径：两处各写一份生成逻辑，
@@ -443,6 +600,10 @@ func applyEnv(c *Config) {
 }
 
 func (c *Config) normalize() error {
+	// 密钥相关的问题先报：它决定鉴权是否按预期分级，配错了比别的字段更要紧。
+	if err := c.normalizeClientKeys(); err != nil {
+		return err
+	}
 	var err error
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5

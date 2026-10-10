@@ -11,7 +11,14 @@
 //   - 更早：折叠为日桶，**永久保留**（看长期趋势）
 //
 // 落盘：data/usage.json，原子替换 + 防抖刷新（默认 30s），重启不丢。
-// 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，实测单桶约 90 字节。
+//
+// 口径：**只统计对话请求**（POST /v1/chat/completions，由调用方保证）。客户端启动时拉的
+// /v1/models、健康检查 /status 都不计入 —— 所以「这台设备调了 100 次」= 100 次对话。
+//
+// 分桶维度 = 时间片 × realm × 账号 × 模型 × 倍率 × **凭据归属**（哪个密钥发起的）。
+// 桶数上界 ≈ 账号数 × 模型数 × 密钥数 × (hourlyKeep + 已过天数)，实测单桶约 100 字节。
+// 这是**乘积**增长：密钥多了以后桶数按倍数涨，但基数很小（3 账号 × 5 模型 × 90 天 ≈ 150 桶），
+// 加到 10 个密钥也只有千级、百 KB 量级，可忽略。maxBuckets 是兜底。
 package usage
 
 import (
@@ -42,29 +49,57 @@ const (
 )
 
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区；旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 3
+// 增加模型生效倍率分区，版本 4 增加凭据归属（key_id / key_name）分区；旧版本缺失字段
+// 按零值加载，旧数据不会丢弃（来源记为未标注）。版本号只用于标识格式演进，
+// load 不做版本分支。
+const fileVersion = 4
 
-// bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
+// bucket 一个 (时间片, realm, uid, model, rate, 凭据归属) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+	Scope   string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm   string  `json:"r"`            // cn / global
+	UID     string  `json:"u"`            // 账号 uid
+	Model   string  `json:"m"`            // 上游裸模型名
+	Rate    string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
+	KeyID   string  `json:"k,omitempty"`  // 凭据归属 id（旧桶为空 = 未标注来源）
+	KeyName string  `json:"kn,omitempty"` // 凭据归属名字（**冗余存**，见 Caller 说明）
+	Req     int64   `json:"q"`            // 请求数（含失败）
+	Err     int64   `json:"e"`            // 失败数
+	PT      int64   `json:"p"`            // prompt tokens
+	CT      int64   `json:"c"`            // completion tokens
+	TT      int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
+	LatMs   int64   `json:"l"`            // 延迟累计（ms）
+	LatN    int64   `json:"ln"`           // 延迟样本数
+	TPS     float64 `json:"v"`            // 吐字速率累计
+	TPSN    int64   `json:"vn"`           // 速率样本数
+	CR      float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
+	CRN     int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
+	CRT     int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
+}
+
+// Caller 发起请求的凭据归属：回答「这条请求是哪台设备发的」。
+//
+// Name 会被**冗余存进每个桶**，而不是只存 ID 之后回 config 里查。理由：密钥删掉之后，
+// 历史统计仍然需要显示它当时叫什么。只存 ID 的话，一次删除就让所有历史行变成
+// 「未知密钥」，而删密钥恰恰是排查历史时会做的事（"那台设备最近用得怎么样，要不要停掉"）。
+// 代价是每个桶多几字节，换历史可读性，划算。
+//
+// 空 ID 表示来源未知（未启用鉴权，或该功能上线前写入的旧桶）。这类数据归到一行，
+// 而不是被混进某个真实密钥名下。
+type Caller struct {
+	ID   string
+	Name string
+}
+
+// bucketKey 桶的 map 键。**所有构造点都必须走这里**。
+//
+// Add / Rollup / load 三处各自拼一遍字符串的话，任何一处漏改（比如新增了维度的
+// load 忘了带上）都会让同一个逻辑桶在两种键之间摇摆 —— 表现为统计数字随重启或折叠
+// 时有时无（一个桶被劈成两半，各剩一半数字），且不会有任何报错。字段顺序只在这里
+// 定义一次。
+func bucketKey(scope, realm, uid, model, rate, keyID string) string {
+	return scope + "|" + realm + "|" + uid + "|" + model + "|" + rate + "|" + keyID
 }
 
 // file 落盘结构。
@@ -155,7 +190,11 @@ type Delta struct {
 //
 // ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
 // 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
-func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+//
+// caller 是发起请求的凭据归属（管理密钥 / 某个客户端密钥 / 空=未标注）。它进入桶键，
+// 因此同一个账号的用量会按「哪台设备在用」分开统计。只对 POST /v1/chat/completions
+// 调用本函数（口径见包注释），/v1/models 之类不计入。
+func (r *Recorder) Add(now time.Time, realm, uid, model string, caller Caller, d Delta, ok bool) {
 	if r == nil {
 		return
 	}
@@ -166,15 +205,22 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		model = "(unknown)"
 	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	key := bucketKey(scope, realm, uid, model, d.ModelRate, caller.ID)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
+		b = &bucket{
+			Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate,
+			KeyID: caller.ID, KeyName: caller.Name,
+		}
 		r.buckets[key] = b
+	} else if b.KeyName == "" && caller.Name != "" {
+		// 名字后补：同一密钥的桶若先由不带名字的路径建出来（或从旧文件加载，
+		// 只有 id），后续请求把名字补上。否则那批桶会永远显示成无名。
+		b.KeyName = caller.Name
 	}
 	b.Req++
 	if !ok {
@@ -236,7 +282,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate})
+		moves = append(moves, move{from: k, to: bucketKey(day, b.Realm, b.UID, b.Model, b.Rate, b.KeyID)})
 	}
 	for _, m := range moves {
 		src := r.buckets[m.from]
@@ -287,7 +333,7 @@ func (r *Recorder) load() error {
 	}
 	for i := range f.Buckets {
 		b := f.Buckets[i]
-		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.Rate] = &b
+		r.buckets[bucketKey(b.Scope, b.Realm, b.UID, b.Model, b.Rate, b.KeyID)] = &b
 	}
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
 	return nil
@@ -441,6 +487,7 @@ type Snapshot struct {
 	ByRealm         []KeyedAgg  `json:"by_realm"`
 	ByAccount       []KeyedAgg  `json:"by_account"`
 	ByModel         []KeyedAgg  `json:"by_model"`
+	ByKey           []KeyedAgg  `json:"by_key"`
 	Series          []Point     `json:"series"`
 	CreditByAccount []CreditAgg `json:"credit_by_account"`
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
@@ -487,6 +534,8 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
 	modelAgg := map[string]*aggAcc{}
+	keyAgg := map[string]*aggAcc{}
+	keyName := map[string]string{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
 	creditAcctAgg := map[string]*creditAcc{}
@@ -544,6 +593,17 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 		}
 		modelAgg[b.Model].add(b)
 
+		// 凭据归属维度：**按 id 分组，不按名字** —— 两台设备起了同一个名字时，
+		// 用名字当键会把它们的用量并成一行，而「哪台用了多少」正是要看的东西。
+		if keyAgg[b.KeyID] == nil {
+			keyAgg[b.KeyID] = &aggAcc{}
+		}
+		keyAgg[b.KeyID].add(b)
+		// 名字取桶里冗余存的那份；同一个 id 的不同桶名字应当一致，取首个非空的即可。
+		if keyName[b.KeyID] == "" && b.KeyName != "" {
+			keyName[b.KeyID] = b.KeyName
+		}
+
 		if strings.HasPrefix(b.Scope, "h:") {
 			scope := strings.TrimPrefix(b.Scope, "h:")
 			if hourSeries[scope] == nil {
@@ -598,7 +658,10 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 		ByAccount: keyed(acctAgg, func(k string) (string, string) {
 			return k, nicks[k]
 		}),
-		ByModel:         keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByModel: keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByKey: keyed(keyAgg, func(k string) (string, string) {
+			return k, keyName[k]
+		}),
 		CreditByAccount: creditKeyed(creditAcctAgg),
 		CreditByModel:   creditKeyed(creditModelAgg),
 		Buckets:         matched,

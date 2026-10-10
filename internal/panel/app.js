@@ -493,6 +493,7 @@ function requestLogText(e) {
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
     e && e.account || '—',
+    e && e.key_name || '—',
     fmtMs(e && e.duration_ms),
     fmtTok(token) + ' tok',
     credit,
@@ -573,6 +574,7 @@ async function loadConfig() {
     applyCfgDeps();       // 按回填后的开关状态置灰从属输入
     $('cfgNote').textContent = '';
     loadEndpoints();
+    loadClientKeys();     // 客户端密钥列表（与配置同页）
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
 
@@ -626,6 +628,95 @@ async function loadEndpoints() {
   el.textContent = d.listen ? '实际生效：' + d.listen : '';
   el.hidden = !d.listen;
 }
+
+/* ── 客户端密钥 ───────────────────────────────────────────────────────
+   分发给其它设备用的密钥：只能调用 /v1 接口，进不了本面板。
+   密钥原文始终在列表里可复制 —— 用户随时要把它贴到设备上；只在创建时显示一次的话，
+   抄漏了就只剩重建这一条路，而重建意味着每台设备都要重新配置。 */
+let ckKeys = {};   // id → 密钥原文，供复制按钮取用（存在内存里，不写进 DOM 属性）
+
+function fmtDay(s) {
+  const d = new Date(s);
+  if (isNaN(d)) return s || '—';
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+    ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+async function loadClientKeys() {
+  const body = $('ckBody');
+  if (!body) return;
+  let d;
+  try { d = await api('client_keys'); }
+  catch (e) {
+    body.innerHTML = '<tr><td colspan="7" class="empty">读取失败：' + esc(e.message) + '</td></tr>';
+    return;
+  }
+  const keys = d.keys || [];
+  ckKeys = {};
+  keys.forEach(k => { ckKeys[k.id] = k.key; });
+  if (!keys.length) {
+    body.innerHTML = '<tr><td colspan="7" class="empty">还没有客户端密钥。填个设备名字，点「新建密钥」。</td></tr>';
+    return;
+  }
+  // 停用的行加 class="off"，mark 列的状态条随之变红（见 .acc tbody tr.off）。
+  body.innerHTML = keys.map(k =>
+    '<tr' + (k.enabled ? '' : ' class="off"') + '>' +
+    '<td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td>' + esc(k.name || '—') + '</td>' +
+    '<td><code class="ck-num">' + esc(k.key) + '</code></td>' +
+    '<td>' + esc(k.note || '—') + '</td>' +
+    '<td class="note">' + esc(fmtDay(k.created_at)) + '</td>' +
+    '<td class="num">' + (k.enabled ? '启用' : '已停用') + '</td>' +
+    '<td class="c-acts">' +
+      '<button type="button" class="xs ghost" data-ck="copy" data-ck-id="' + esc(k.id) + '">复制</button>' +
+      '<button type="button" class="xs ghost" data-ck="toggle" data-ck-id="' + esc(k.id) +
+        '" data-ck-to="' + (k.enabled ? '0' : '1') + '">' + (k.enabled ? '停用' : '启用') + '</button>' +
+      '<button type="button" class="xs ghost" data-ck="del" data-ck-id="' + esc(k.id) +
+        '" data-ck-name="' + esc(k.name || '') + '">删除</button>' +
+    '</td></tr>').join('');
+}
+
+/* 事件委托：列表是整段 innerHTML 替换出来的，逐个绑会在每次刷新后失效。 */
+document.addEventListener('click', async ev => {
+  const btn = ev.target.closest ? ev.target.closest('[data-ck]') : null;
+  if (!btn) return;
+  const id = btn.dataset.ckId;
+  try {
+    if (btn.dataset.ck === 'copy') {
+      const v = ckKeys[id] || '';
+      try { await navigator.clipboard.writeText(v); toast('已复制密钥，可直接贴到设备上', 'ok'); }
+      catch (e) { toast('复制失败，请手动选中密钥文本复制', 'err'); }
+      return;
+    }
+    if (btn.dataset.ck === 'toggle') {
+      const on = btn.dataset.ckTo === '1';
+      await api('client_keys/enabled', { method: 'POST', body: JSON.stringify({ id, enabled: on }) });
+      toast(on ? '已启用，立即生效' : '已停用，该设备立即无法调用', 'ok');
+    } else {
+      const nm = btn.dataset.ckName || id;
+      if (!confirm('删除密钥「' + nm + '」？\n\n该设备会立即无法调用，此操作不可撤销。\n' +
+                   '历史用量与请求日志仍会保留这个名字。')) return;
+      await api('client_keys/remove', { method: 'POST', body: JSON.stringify({ id }) });
+      toast('已删除「' + nm + '」', 'ok');
+    }
+    loadClientKeys();
+  } catch (e) { toast('操作失败：' + e.message, 'err'); }
+});
+
+$('btnCkCreate').onclick = async () => {
+  const nameEl = $('ckName');
+  const name = (nameEl.value || '').trim();
+  if (!name) { toast('请先填设备名字', 'err'); nameEl.focus(); return; }
+  try {
+    await api('client_keys', { method: 'POST',
+      body: JSON.stringify({ name, note: ($('ckNote').value || '').trim() }) });
+    nameEl.value = ''; $('ckNote').value = '';
+    $('ckHint').textContent = '';
+    toast('已创建「' + name + '」，在下方列表点「复制」取密钥', 'ok');
+    loadClientKeys();
+  } catch (e) { toast('创建失败：' + e.message, 'err'); }
+};
 
 /* 复制按钮：按钮上的 data-ep 指向要复制的元素 id。 */
 document.querySelectorAll('[data-ep]').forEach(btn => {
@@ -1610,6 +1701,14 @@ function renderUsage(d) {
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  /* 按客户端：key 是密钥 id（稳定不变），extra 是当时记录的名字。
+     名字优先显示 —— 用户认的是「客厅电视」而不是 k_ab12cd。
+     名字为空以「未标注」呈现（未鉴权流量与功能上线前的历史数据），
+     这类数据归属不明，不能算到任何一把密钥头上。 */
+  $('usKeyBody').innerHTML = (d.by_key || []).map(x =>
+    usRow(x.extra || (x.key ? x.key : '未标注'), '', x, '', false)).join('') ||
+    '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
 
   renderCreditDimensions(d);
   renderUsageChart(d.series || []);

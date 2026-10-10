@@ -299,6 +299,7 @@ func (r *Runtime) build(entry EntryConfig) error {
 
 	// livecfg 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	r.live = livecfg.New(livecfg.Snapshot{
+		Creds:                credentialsOf(cfg),
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
@@ -328,6 +329,7 @@ func (r *Runtime) build(entry EntryConfig) error {
 	// 面板配置页的读写闭包：与命令行入口共用同一套 Load/saveConfig，
 	// 保证「面板保存」与「启动加载」永远走同一份校验逻辑。
 	cfgPath := r.ConfigPath
+	listKeys, createKey, setKeyEnabled, removeKey := r.ClientKeysAPI()
 	r.Panel = panel.New(panel.Config{
 		Pool:        r.Pool,
 		Usage:       r.Usage,
@@ -361,6 +363,13 @@ func (r *Runtime) build(entry EntryConfig) error {
 		// 密钥重置：落盘 + 热生效，无需重启（api_key 在 hotAppliedFields 里）。
 		// 服务端部署同样可用（没有 UI 交付问题，用户可以自己读响应）。
 		RotateAPIKey: r.RotateAPIKey,
+		// 客户端密钥的增删改查：落盘 + 热生效（client_keys 在 hotAppliedFields 里，
+		// 改完下一个请求即按新集合鉴权）。密钥由 appcore 生成并落盘，
+		// panel 只做 HTTP 编排（见 panel/clientkeys.go 的分工说明）。
+		ListClientKeys:      listKeys,
+		CreateClientKey:     createKey,
+		SetClientKeyEnabled: setKeyEnabled,
+		DeleteClientKey:     removeKey,
 	})
 
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后

@@ -160,6 +160,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
+| **多密钥分发 + 用量按客户端** | **管理密钥**（`api_key`）与**客户端密钥**（`client_keys`）分离：客户端密钥只能调 `/v1/*`、**进不了管理面板**，可带设备名字单独启停 / 吊销，改动**热生效无需重启**；用量与请求日志按密钥归属统计（**删除后仍保留当时的名字**），未鉴权流量归「未标注」而**不**计入管理密钥 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
@@ -228,18 +229,25 @@ CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git
 mkdir -p auths data && cp config.example.json config.json
 #    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
 
-# 2. 拉取并运行
+# 2. 拉取并运行（镜像名 = 仓库路径；本仓库是 ghcr.io/ailanunu/workbuddy2api-panel）
+IMAGE=ghcr.io/ailanunu/workbuddy2api-panel:latest
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  "$IMAGE"
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
 ```
 
+> 把镜像拉不下来（包未发布或仍是私有）时，用下面的「方式一」本地构建即可，功能完全一致。
+
 > **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `workbuddy2api-panel` →
 > Package settings → Change visibility → Public，否则拉取需要 `docker login ghcr.io`。
+>
+> **镜像名随仓库走**：CI 用 `${{ github.repository }}` 生成镜像名，所以发布的镜像名与仓库路径一致
+> （上游是 `ghcr.io/linguo2625469/workbuddy2api-panel`，fork 后是 `ghcr.io/<你的用户名>/workbuddy2api-panel`）。
+> 上面命令里的镜像名请按你实际使用的仓库替换。
 >
 > 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
 > `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
@@ -248,12 +256,14 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/AilaNuNu/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
 #    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    ⚠️ 配置若来自桌面版：先把 "desktop" 改成 false（或删掉该键），否则容器会去
+#       ~/.local/share/workbuddy2api 找账号 → 挂载的 ./auths 等于没挂（见「配置说明」）
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -264,6 +274,8 @@ curl -s http://localhost:7863/healthz
 ```
 
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
+
+> 要放到公网给外部设备用（端口转发 / TLS 反代 / 只暴露 `/v1`），见「部署运维」一节的**反向代理**；**升级**与**备份恢复**步骤也在那一节。
 
 常用运维命令：
 
@@ -349,12 +361,24 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 **`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。下表为字段含义速查。
 
+**配置与数据的分工**：`config.json` 只存配置与密钥，**不含登录态**。账号登录态在 `auths/*.json`（`accessToken` / `refreshToken`），运行状态在 `data/`（池状态 `state.json`、用量 `usage.json`、请求归档 `request-logs/`）。迁移时 `auths/` 要一起带走，`data/` 不带则统计与冷却状态从零开始。
+
+> ⚠️ **桌面版的 `config.json` 不能直接拷到服务器/容器**：桌面版会写入 `"desktop": true`，这个字段把路径语义切到「用户数据目录」——
+> Linux 上会去 `$XDG_DATA_HOME/workbuddy2api`（或 `~/.local/share/workbuddy2api`）找账号，而**不是** `./auths`。
+> 容器里的表现是「`auths` 明明挂载了、账号池却显示 0 个」。
+> 迁移时二选一：把 `"desktop"` 改成 `false`（或删掉该键），或显式写死 `"auth_dir": "/app/auths"` 与 `"state_file": "/app/data/state.json"`
+> —— **显式值在两种模式下都优先**。注意面板「配置」页不暴露 `desktop` 字段，只能手工改文件。
+>
+> `auths/*.json` 本身**不含任何机器绑定**（无设备 id / 主机名 / IP），格式上可直接跨机器使用；
+> 但上游是否会因 IP / 地区突变把既有会话判为风险，属于平台侧策略，本仓库无法保证——迁移后请先用 `/status` 确认账号可用。
+
 ### 字段速查
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | **管理密钥**：网关鉴权 + 管理面板鉴权；**空 = 不鉴权直接放行**（公网必须设置） |
+| `client_keys` | 空 | **客户端密钥**列表：分发给其它设备使用，只能调用 `/v1/*`，**进不了管理面板**。每项 `name`（设备名字，必填且不重名）+ `key` + `enabled` + `created_at` + `note`。`api_key` 为空时不允许配置（分级密钥在「面板完全不鉴权」下没有意义） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
@@ -551,7 +575,8 @@ http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分四个视图：
+**只有管理密钥（`api_key`）能进面板**——客户端密钥即使有效，访问 `/panel/api/*` 也一律 401（实测）；它只能调用 `/v1/*`。
+界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航共 **7 个入口**（账号池 / 用量 / 积分构成 / 任务中心 / 模型与档位 / 配置 / 运行日志），下表按功能归类：
 
 | 视图 | 功能 |
 |---|---|
@@ -559,14 +584,29 @@ http://127.0.0.1:7863/panel/
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
-| **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
+| **配置** | 在线编辑 config.json：API 密钥、**客户端密钥管理**（新建 / 复制 / 停用 / 删除）、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
+| **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动）；请求表格每行带**密钥名字**列，用于区分请求来自哪台设备 |
 
-**配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
+**配置热生效**：保存配置后，`api_key`、`client_keys`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
+
+### 客户端密钥（把多把密钥分发给多台设备）
+
+`api_key` 只有一把，而且**同时管着管理面板**——直接发给外网设备等于把面板也一起发出去。所以面板支持额外的**客户端密钥**：
+
+- 在「配置」页底部「客户端密钥」块**新建**：填**设备名字**（如「客厅电视」）+ 可选备注，密钥由服务端生成，列表里随时可复制。
+- 每把可**单独停用 / 启用 / 删除**，改动**立即生效、无需重启**（下一个请求即按新集合鉴权），且状态与密钥一起落盘（重启后保持）。
+- 客户端密钥**只能调用 `/v1/*`**（`/v1/chat/completions`、`/v1/models`、`/status`）；访问 `/panel/api/*` 一律 401。
+- 名字会随**用量统计**与**请求日志**一起记录，用来区分是哪台设备；**删除密钥后历史统计仍显示当时的名字**。
+- 停用是首选的止血动作（比删除温和、可恢复）；删除不可撤销，但历史统计保留名字。
+- **`api_key` 为空时不允许配置客户端密钥**（面板返回 400 并说明原因）：面板完全不鉴权时，分级密钥没有意义。
+
+**用量页新增「按客户端」表**：按密钥统计请求数、失败数、Prompt / Completion / 合计 token。未鉴权流量与升级前的历史数据归入「未标注」——**不会算到管理密钥头上**。请求日志（面板「运行日志」页）每行也带密钥名字，并支持按 id 或名字过滤（`/panel/api/request_logs?key=<名字或id>`）。
+
+> 密钥值在「配置」页是**明文展示**的（`api_key` 一直如此），因为要复制到设备上；面板不是公网入口，请按[安全与合规](#安全与合规)的边界使用——公网只暴露 `/v1/*`。
 
 顶部「刷新」按钮 = 向上游全量查询真实余额并回写（5 秒自动轮询只读内存，不打上游）。
 
@@ -582,12 +622,16 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
+| `POST /v1/chat/completions` | Bearer（管理密钥或客户端密钥） | OpenAI 兼容补全；流式/非流式；**网关侧不设请求体上限**（对齐上游，超限类问题由上游自然返回错误） |
+| `GET /v1/models` | Bearer（管理密钥或客户端密钥） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
+| `GET /status` | Bearer（管理密钥或客户端密钥） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：仅当**存在可用凭据**（`api_key` 非空，或配置了处于启用状态的 `client_keys`）才校验 `Authorization: Bearer <密钥>`；
+> `api_key` 为空且没有客户端密钥时，上述端点直接放行。`/healthz` 恒无鉴权。
+>
+> **两种密钥的适用范围**：**管理密钥**（`api_key`）可用全部端点；**客户端密钥**只能用于 `/v1/chat/completions`、`/v1/models`、`/status`，
+> 访问 `/panel/api/*` 一律 **401**（实测）。任一把客户端密钥被停用或删除后**立即失效、无需重启**。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
@@ -673,6 +717,117 @@ http://127.0.0.1:7863/panel/
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
 
+### 升级
+
+两种部署方式对应两套动作，**都不会动到 `./auths`、`./data`、`./config.json`**（它们是宿主机挂载卷，不在镜像里）：
+
+```bash
+# 方式一（compose 本地构建，推荐）
+git pull
+docker compose up -d --build        # 重建镜像并替换容器，卷与配置不变
+
+# 方式〇（GHCR 镜像）
+IMAGE=ghcr.io/ailanunu/workbuddy2api-panel:latest
+docker pull "$IMAGE"
+docker stop workbuddy2api && docker rm workbuddy2api
+# 再用与首次完全相同的 docker run 命令重新起（卷参数照抄即可）
+```
+
+升级前看一眼、升级后再看一眼：
+
+- **升级前**：先备份（见下）。涉及配置结构变化的版本，回退旧版本比重新逐个登录账号省事得多。
+- **升级后**：面板侧栏显示的版本号应变成新版本；`docker compose logs` 里能看到新版本的启动日志。
+- **配置兼容性**：新版读旧 `config.json` 只补齐新字段的默认值，未知键原样保留（面板保存走的也是深合并）；旧版读新配置会忽略它不认识的键。
+- **数据兼容性**：`usage.json` 带格式版本号（版本 2 起增加积分观测字段，版本 4 起按密钥分区），旧版本数据按空值加载而非丢弃；`state.json` 是池的运行时状态。两者都建议先备份。
+
+### 备份与恢复
+
+要备的只有三样，都在宿主机上，跟容器无关：
+
+| 路径 | 内容 | 说明 |
+|---|---|---|
+| `auths/` | 账号凭证（`accessToken` / `refreshToken`） | **最重要**，丢了要逐个重新 OAuth 登录 |
+| `config.json` | 配置 + `api_key` + `client_keys` | 含明文密钥，注意文件权限 |
+| `data/` | 池状态 `state.json` + 用量 `usage.json` + 请求归档 `request-logs/` | 归档可能很大，只保统计可跳过 |
+
+```bash
+# 备份（停一下拿稳定快照；config.json 与 auths 本身是原子写，不停也基本安全）
+docker compose stop
+tar czf wb2api-backup-$(date +%Y%m%d-%H%M).tar.gz auths data config.json
+docker compose start
+
+# 恢复：解包回项目目录，再起容器
+tar xzf wb2api-backup-YYYYMMDD-HHMM.tar.gz
+sudo chown -R 10001:10001 auths data config.json   # 属主不对会报 permission denied（见常见问题）
+docker compose up -d
+```
+
+`docker compose down` **不会**删掉 `./auths` 与 `./data`（它们是宿主机目录）。本项目不用命名卷，所以也不存在 `down -v` 清空数据的问题。
+
+### 反向代理：公网只暴露 `/v1`（推荐做法）
+
+服务自身只有明文 HTTP，**公网部署必须加 TLS 反代**，并且把管理面板挡在外面。两层配合：
+
+1. **容器只绑回环**：把 `docker-compose.yml` 的 `ports` 改成 `- "127.0.0.1:7863:7863"`，这样 7863 只有本机反代能访问。
+2. **路由器只转发 443，不转发 7863**，公网入口只有反代这一个。
+3. **反代只放行 `/v1/`**，`/panel/`、`/healthz` 一律拒绝。
+
+Nginx（`/etc/nginx/conf.d/wb2api.conf`）：
+
+```nginx
+# 公网入口按 IP 兜一层限流（网关自身没有防爆破/限流，凭证泄露时至少不至于被无限刷）
+limit_req_zone $binary_remote_addr zone=wb2api:10m rate=5r/s;
+
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+    location /v1/ {
+        limit_req zone=wb2api burst=10 nodelay;
+        proxy_pass http://127.0.0.1:7863;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+
+        # ⚠️ SSE 流式三件套：不关缓冲的话回复会被攒着一次性吐出，表现为「卡住不动」
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;     # 长生成可能远超默认 60s，超时会截断流
+        proxy_send_timeout 3600s;
+    }
+
+    location / { return 404; }        # 面板、健康检查、其余路径都不对外
+}
+
+server {
+    listen 80;
+    server_name api.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+Caddy（自动申请证书；`flush_interval -1` 等价于关缓冲）：
+
+```caddy
+api.example.com {
+    @api path /v1/*
+    handle @api {
+        reverse_proxy 127.0.0.1:7863 {
+            flush_interval -1
+        }
+    }
+    respond 404
+}
+```
+
+几个要点：
+
+- **`/status` 放不放出去？** 它返回账号池状态（积分、冷却、UID 前缀），客户端密钥可以调。不想让外部看到账号规模就一并挡掉，只留 `/v1/`。
+- **客户端密钥不是匿名凭证**：拿到就能用你的额度，所以要按设备发、能单独吊销。一旦怀疑泄露，在面板上**停用那一把**（立即生效），而不是轮换 `api_key`（那会把所有设备一起打断）。
+- **限流必须加**：上面的 `limit_req` 是反代层的兜底。
+- **别用「`/` 全放行 + 给面板设强密码」代替**：面板页本身是可匿名加载的，`/panel/api/config` 会回明文密钥。
+
 ### 工具脚本
 
 | 脚本 | 用途 |
@@ -730,14 +885,16 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 ### 2. 网络暴露与日志敏感度
 
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
-- 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
+- **公网只暴露 `/v1/*`**：管理面板（`/panel/`）不要对公网开放（走内网 / VPN，或由反代加访问控制与限流）。发给外部设备的是**客户端密钥**（只能调 `/v1/*`、进不了面板、可单独吊销），**不要发 `api_key`**——它同时管着管理面板
+- 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / **密钥名字**（只是名字，不是密钥值） / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` / 客户端密钥明文
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **产物由 CI 自动构建**：推 `desktop-v*` tag → GitHub Actions 构建 Windows 桌面版并发布 Release（NSIS 安装包 `setup.exe` + 免安装 `zip` + `checksums.txt`）；`v*` tag 走上游那条多平台单文件二进制流水线。Release 产物**不含** `data/` 与 `config.json`
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
+- **有产物校验和**：每个 Release 附 `checksums.txt`（`sha256sum *`），下载后 `sha256sum -c checksums.txt` 校验；`go.sum` 只约束 Go 模块依赖
+- **Docker 镜像两种来源**：push 到 `main` 由 CI 构建并推送多架构镜像到 GHCR（见「方式〇」），或本地 `docker compose up -d --build` 自行构建（见「方式一」）；仓库内 Dockerfile 只依赖官方 `golang` / `alpine` 基础镜像
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界
@@ -796,6 +953,46 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
 
+### 把桌面版的 config.json 拷到服务器后，账号池显示 0 个？
+
+桌面版会在配置里写 `"desktop": true`，这个字段把路径语义切到「用户数据目录」。Linux 上账号会从
+`$XDG_DATA_HOME/workbuddy2api`（或 `~/.local/share/workbuddy2api`）读取，**不是** `./auths`——
+所以容器里表现为「`auths` 挂载好了、账号却一个都没有」。
+
+改法二选一：
+
+```jsonc
+"desktop": false                              // 或直接删掉这个键
+"auth_dir": "/app/auths",                     // 或显式写死路径；显式值在两种模式下都优先
+"state_file": "/app/data/state.json"
+```
+
+注意面板「配置」页不暴露 `desktop` 字段（它不属于可在线编辑的表单），只能手工改文件。
+另外 `config.json` **不含登录态**——`auths/` 必须一起拷过去，否则无论如何都是 0 个账号。
+
+### 该把哪把密钥发给外部设备？
+
+发**客户端密钥**，不要发 `api_key`。`api_key`（管理密钥）同时管着管理面板，发出去等于把
+「看账号、改配置、重置密钥」一起交出去；客户端密钥只能调用 `/v1/*`，进不了面板，且可**单独停用或删除**。
+
+在面板「配置」页底部「客户端密钥」里按设备新建（填设备名字），点「复制」取密钥贴到设备上。
+用量页的「按客户端」表按密钥分别统计，方便对账是哪台设备在用。
+
+### 加了反向代理后，流式回复「卡住不动」最后一次性吐出来？
+
+反代默认会缓冲响应体，SSE 的增量被攒在中间层，前端就表现为长时间无输出。关掉缓冲即可：
+
+- **Nginx**：`proxy_buffering off;`（`proxy_cache off;` 一并关），并把 `proxy_read_timeout` / `proxy_send_timeout` 调大（默认 60s 会截断长生成）。
+- **Caddy**：`reverse_proxy 127.0.0.1:7863 { flush_interval -1 }`。
+
+完整配置见「部署运维 → 反向代理：公网只暴露 `/v1`」。
+
+### Docker 部署后容器一直显示 unhealthy？
+
+镜像自带的 `HEALTHCHECK` 打的是 `/healthz`，而 `/healthz` 在**没有可用账号**时返回 503
+（它的语义是「有没有账号能服务」，不是「进程还活着」）。账号全在冷却/熔断中时容器会被标成 unhealthy
+——这通常说明账号侧有问题，而不是容器坏了。想探活而不看账号状态，用 `/panel/` 或直接 `docker logs`。
+
 ## 关键断言 ↔ 代码出处
 
 | 断言 | 出处 |
@@ -822,6 +1019,14 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | streak 端点 `activity/growth/streak` | `internal/upstream/travel.go:24`（常量）、`:139`（`GrowthStreak`） |
 | Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:21` |
 | 静态模型表含 `deepseek-v4-flash` 等 | `internal/server/handler.go:146` |
+| 客户端密钥进不了管理面板（只收管理凭据） | `internal/panel/panel.go:257`（`withAuth` 判 `id.Admin`） |
+| 仅存在非空凭据才要求鉴权（与鉴权层同口径） | `internal/livecfg/livecfg.go` `AuthRequired`；判据对齐 `internal/httpauth/httpauth.go:63` |
+| 未鉴权流量不计入管理密钥 | `internal/httpauth/httpauth.go:70`（无凭据 → 空身份）；`internal/server/handler.go:179`（`callerOf`） |
+| `api_key` 为空时禁止配置 `client_keys` | `internal/appcore/config.go:412` |
+| 「哪些密钥能过」只在 `credentialsOf` 判定 | `internal/appcore/config.go:463` |
+| 用量按密钥 id 分组 + 桶内冗余名字 | `internal/usage/usage.go:65-66`（桶字段）、`:217`（写入）、`:285`（折叠键含 KeyID） |
+| 请求日志只存密钥 id 与名字、不存密钥值 | `internal/reqlog/reqlog.go:67-68`；按 id 或名字过滤 `:580` |
+| 客户端密钥改动热生效（无需重启） | `internal/appcore/config_diff.go:35`（`hotAppliedFields`） |
 
 ## 免责声明
 

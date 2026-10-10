@@ -240,12 +240,15 @@ vm.runInContext(
   ctx
 );
 const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
-const good = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12, request_id: 'req-1' };
+const good = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', key_name: '客厅电视', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12, request_id: 'req-1' };
 const bad = { ...good, status: 500, outcome: 'http_error', request_id: 'req-2' };
+// 未鉴权流量与功能上线前的历史数据没有密钥名字，这一列应显示 —
+const anon = { ...good, key_name: '', request_id: 'req-3' };
 process.stdout.write(JSON.stringify({
   good: ctx.requestLogText(good),
   goodLine: ctx.requestLogLine(good),
   badLine: ctx.requestLogLine(bad),
+  anon: ctx.requestLogText(anon),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "request-log-format-*.cjs")
 	if err != nil {
@@ -259,10 +262,12 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("request log formatting node test failed: %v\n%s", err, out)
 	}
-	const text = "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit | req-1"
+	// 「密钥名字」列插在账号之后：用它区分是哪台设备发的（未鉴权/历史数据显示 —）。
+	const text = "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 客厅电视 | 1.25s | 2.3k tok | 0.12 credit | req-1"
 	want := `{"good":` + strconv.Quote(text) +
 		`,"goodLine":` + strconv.Quote(`<span class="ln">`+text+`</span>`) +
-		`,"badLine":` + strconv.Quote(`<span class="ln e">14:05:06 | 500 HTTP 错误 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit | req-2</span>`) + `}`
+		`,"badLine":` + strconv.Quote(`<span class="ln e">14:05:06 | 500 HTTP 错误 | glm-5.3 | 账号(uid8) | 客厅电视 | 1.25s | 2.3k tok | 0.12 credit | req-2</span>`) +
+		`,"anon":` + strconv.Quote("14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | 1.25s | 2.3k tok | 0.12 credit | req-3") + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
 	}

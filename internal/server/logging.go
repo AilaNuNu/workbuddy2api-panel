@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -289,10 +290,28 @@ func uidPrefix(uid string) string {
 type requestTraceKey struct{}
 
 // requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
+//
+// keyID / keyName 由 withAuth 在鉴权通过后**回填**：trace 是在 ServeHTTP 里创建的，
+// 那时鉴权还没跑，身份未知；而出口的 defer 拿不到 withAuth 写进更深一层 context 的身份
+// （context 只向下传递，不回传）。所以用同一个 trace 指针回填，出口时就能读到。
+// 两者在同一 goroutine 上先后执行（mux.ServeHTTP 是同步调用），不存在竞争。
 type requestTrace struct {
-	id    string
-	start time.Time
-	stat  *chatStat
+	id      string
+	keyID   string
+	keyName string
+	start   time.Time
+	stat    *chatStat
+}
+
+// setIdentity 记录这条请求命中的密钥身份（由 withAuth 调用；trace 可能不存在）。
+//
+// 允许 nil 接收者：不是每个请求都会创建 trace（未启用归档时不创建），
+// 鉴权层不该为此加判空分支。
+func (t *requestTrace) setIdentity(id httpauth.Identity) {
+	if t == nil {
+		return
+	}
+	t.keyID, t.keyName = id.ID, id.Name
 }
 
 func requestTraceFrom(r *http.Request) *requestTrace {
@@ -309,6 +328,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		RequestID: t.id,
 		Path:      "/v1/chat/completions",
 		Status:    status,
+		KeyID:     t.keyID,
+		KeyName:   t.keyName,
 	}
 	duration := time.Since(t.start)
 	e.DurationMs = duration.Milliseconds()

@@ -31,8 +31,9 @@ import (
 // hotAppliedFields 面板保存时**立即生效**、不需要重启的顶层字段名（按 JSON 名）。
 // 与 config_save.go 的热应用清单一一对应，两处必须同步。
 var hotAppliedFields = []string{
-	"api_key",  // livecfg 快照，下一个请求即生效
-	"cooldown", // livecfg 快照（soft_rate / soft_rate_max）
+	"api_key",     // livecfg 快照，下一个请求即生效
+	"client_keys", // livecfg 快照（展开成 Creds），新增/停用/删除下一个请求即生效
+	"cooldown",    // livecfg 快照（soft_rate / soft_rate_max）
 	"features", // up.SanitizeFingerprints 直接赋值
 	"pool",     // pool 的一批 Set* 方法
 	"schedule", // Scheduler.Reconfigure / SetBalanceInterval

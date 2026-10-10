@@ -100,3 +100,62 @@ func TestArchivePruneHonorsSize(t *testing.T) {
 		t.Fatalf("remaining = %+v, want newest file only", entries)
 	}
 }
+
+// TestArchiveFilterByKey 按密钥过滤归档：既能按 id 也能按名字匹配。
+//
+// 「这台设备用了多少、发了什么」是拿到密钥分发出去之后第一个要回答的问题，面板的
+// /panel/api/request_logs 因此暴露 ?key=<id 或名字>：用户看到/记住的是名字，
+// 而归档里稳定的标识是 id，两种写法都必须能用。
+func TestArchiveFilterByKey(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Minute)
+	for i, e := range []Event{
+		{RequestID: "a", KeyID: "k_aaa", KeyName: "客厅电视"},
+		{RequestID: "b", KeyID: "k_bbb", KeyName: "卧室平板"},
+		{RequestID: "c", KeyID: "admin", KeyName: "管理密钥"},
+		{RequestID: "d"}, // 未鉴权流量 / 升级前的历史数据：没有密钥归属
+	} {
+		e.Time = base.Add(time.Duration(i) * time.Second)
+		e.Model = "glm-5.3"
+		e.Status = 200
+		e.OK = true
+		e.Outcome = OutcomeSuccess
+		r.Record(e)
+	}
+	r.Close()
+
+	ids := func(filter Filter) []string {
+		rows, err := r.ReadArchive(10, filter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.RequestID)
+		}
+		return out
+	}
+
+	for _, tc := range []struct{ name, key, want string }{
+		{"按名字", "客厅电视", "a"},
+		{"按 id", "k_bbb", "b"},
+		{"管理密钥也可以筛", "管理密钥", "c"},
+		{"管理密钥按 id 筛", "admin", "c"},
+	} {
+		got := ids(Filter{Key: tc.key})
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("%s（key=%q）= %v，期望只有 %s", tc.name, tc.key, got, tc.want)
+		}
+	}
+
+	// 关键：没有密钥归属的记录**不会**被任何密钥筛出来。
+	// 否则「某台设备用了多少」会把升级前/未鉴权的历史流量算进去，数字虚高且无从对账。
+	for _, key := range []string{"客厅电视", "卧室平板", "管理密钥", "admin", "k_"} {
+		for _, id := range ids(Filter{Key: key}) {
+			if id == "d" {
+				t.Errorf("key=%q 筛出了无密钥归属的记录 d", key)
+			}
+		}
+	}
+}

@@ -32,13 +32,20 @@ func (r *Runtime) RotateAPIKey() (string, error) {
 		return "", err
 	}
 
-	if _, err := mergeAndWriteConfig(r.ConfigPath, []byte(fmt.Sprintf(`{"api_key":%q}`, key))); err != nil {
+	newCfg, err := mergeAndWriteConfig(r.ConfigPath, []byte(fmt.Sprintf(`{"api_key":%q}`, key)))
+	if err != nil {
 		return "", fmt.Errorf("rotate api_key: %w", err)
 	}
 
 	// 落盘成功后才热应用；带上快照里的其它字段，避免被整体替换清空。
 	snap := r.live.Load()
 	snap.APIKey = key
+	// Creds 必须**整体重建**，不能只改 APIKey：凭据列表里还留着旧管理密钥，
+	// 只改 APIKey 的话旧密钥继续有效 —— 而「重置密钥」的全部意义就是让它立刻失效。
+	//
+	// 用落盘后的 newCfg 而不是 r.Config 重建：r.Config 是**启动时**的装配基线
+	// （面板保存不更新它），拿它重建会把面板后来新增的客户端密钥全部丢掉。
+	snap.Creds = credentialsOf(newCfg)
 	r.live.Store(snap)
 
 	// 同步内存中的运行配置，使 r.Config 继续代表「当前生效的配置」：

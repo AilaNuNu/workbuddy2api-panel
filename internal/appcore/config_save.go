@@ -38,7 +38,9 @@ func saveConfig(raw []byte, path string, running *Config, live *livecfg.Holder, 
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	// client_keys 也是热生效字段：面板里新增/停用/删除密钥后，下一个请求即按新集合鉴权。
 	live.Store(livecfg.Snapshot{
+		Creds:                credentialsOf(newCfg),
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,

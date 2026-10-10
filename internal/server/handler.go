@@ -74,6 +74,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
+		Creds:        httpauth.AdminCred(h.cfg.APIKey),
 		APIKey:       h.cfg.APIKey,
 		SoftCooldown: h.cfg.SoftCooldown,
 	}
@@ -156,13 +157,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// identityKey 请求上下文里携带"命中的密钥身份"（由 withAuth 写入）。
+// 用量统计与请求日志据此回答"这条请求是哪台设备发的"。
+type identityKey struct{}
+
+// identityFrom 取当前请求命中的密钥身份；未鉴权（api_key 为空）或未经过 withAuth 时，
+// 返回零值身份（ID 为空），调用方应把它当作"未知来源"而不是"管理密钥"。
+func identityFrom(r *http.Request) httpauth.Identity {
+	if r == nil {
+		return httpauth.Identity{}
+	}
+	id, _ := r.Context().Value(identityKey{}).(httpauth.Identity)
+	return id
+}
+
+// callerOf 把请求命中的身份转成用量统计的「凭据归属」。
+//
+// 未启用鉴权时（api_key 为空）身份本身是空的（见 httpauth.Authenticate），这里就得到
+// 空的 Caller —— 统计归入「未标注」一行，而不是被误记到管理密钥名下。那会让
+// "管理密钥用了多少"在有人为了排查而临时关掉鉴权的窗口里凭空变大。
+func callerOf(r *http.Request) usage.Caller {
+	id := identityFrom(r)
+	return usage.Caller{ID: id.ID, Name: id.Name}
+}
+
+// withAuth 校验 Bearer 凭据，并把命中的身份写进请求上下文。
+//
+// 网关接受**全部**凭据：管理密钥 + 已启用的客户端密钥。客户端密钥存在的意义就是给下游
+// 设备调 /v1/*，所以这里不区分两类。分级发生在面板侧 —— 面板只接受管理凭据，
+// 因此客户端密钥拿不到任何管理能力（这是"把密钥发给别人"能成立的前提）。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		id, ok := httpauth.Authenticate(r, h.loadLive().Creds)
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		// 回填归档 trace：出口的 defer 读不到这里写进 context 的身份（context 不回传）。
+		requestTraceFrom(r).setIdentity(id)
+		next(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
 	}
 }
 
@@ -615,7 +648,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 				realm = a.Realm
 			}
-			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+			// caller 从这里取（而不是在 ServeHTTP 出口处）：这条路就是唯一的记账点，
+			// 且 r 是 withAuth 换过的那份，身份可取。
+			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, callerOf(r), usage.Delta{
 				PromptTokens:     delta.PromptTokens,
 				HasPromptTokens:  delta.HasPromptTokens,
 				CompletionTokens: delta.CompletionTokens,
