@@ -170,6 +170,14 @@ $('btnKey').onclick = async () => {
   } catch (e) { $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+/* 配置文件路径一键复制：用户要拿这个路径去资源管理器里找文件，手抄容易错。
+   路径由服务端注入（见 index.go 的 renderIndex），此处只负责复制。 */
+$('btnKeyCfgCopy').onclick = async () => {
+  const p = $('keyCfgPath').textContent.trim();
+  if (!p) return;
+  try { await copyText(p); toast('已复制路径：' + p, 'ok'); }
+  catch (e) { toast('复制失败，请手动选中路径', 'err'); }
+};
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };

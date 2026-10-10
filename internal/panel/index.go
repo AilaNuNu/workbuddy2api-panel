@@ -9,7 +9,9 @@
 package panel
 
 import (
+	"bytes"
 	_ "embed"
+	"html"
 	"net/http"
 )
 
@@ -18,6 +20,11 @@ var indexHTML []byte
 
 //go:embed app.js
 var appJS []byte
+
+// configPathPlaceholder 是 index.html 里密钥门文案中的占位符，由 index 在响应时
+// 替换为实际的配置文件路径。用 HTML 注释之外的裸 token（不使用模板引擎）是为了
+// 保持"无外部构建依赖"的现状：页面仍是可直接双击打开的静态文件，只是多一行替换。
+const configPathPlaceholder = "{{CONFIG_PATH}}"
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -49,7 +56,30 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	_, _ = w.Write(p.renderIndex())
+}
+
+// renderIndex 把配置文件路径注进页面骨架（纯计算，便于测试）。
+//
+// 为什么非要在页面里给出**实际路径**：密钥门出现在鉴权之前——此刻用户既进不了配置页，
+// 也调不到任何 /panel/api/*，页面本身是匿名可加载的。原本文案只说「密钥在 config.json
+// 里」，而桌面版把数据目录钉在 %APPDATA%\WorkBuddy2API（与安装目录无关），拿到安装包
+// 的人根本不知道该去哪找这个文件，于是只能卡在密钥窗口前。
+//
+// 只有桌面版才吐出绝对路径，服务端部署仍回落为 "config.json"：
+//   - 服务端面板可能挂在公网，而页面是匿名可加载的；把宿主/容器的文件系统路径白送给
+//     任何访客，会破坏「面板 HTML 本身无秘密」这条不变量（见 panel.go 包注释）。
+//   - 部署方本来就知道自己把配置放在哪（启动日志里也打了「配置已加载：<path>」），
+//     不缺这条线索；而桌面版的数据目录是本机用户的 %APPDATA%，路径对访客无意义，
+//     对用户却是唯一能定位到 config.json 的线索。
+//
+// 路径可能含 "&" 等字符（用户名），所以按 HTML 文本转义后再注入，不做属性拼接。
+func (p *Panel) renderIndex() []byte {
+	path := p.cfg.ConfigPath
+	if !p.cfg.Desktop || path == "" {
+		path = "config.json"
+	}
+	return bytes.Replace(indexHTML, []byte(configPathPlaceholder), []byte(html.EscapeString(path)), 1)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
